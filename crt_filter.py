@@ -5,6 +5,7 @@ import sys
 import subprocess
 import importlib
 from pathlib import Path
+import json
 from typing import Optional, Tuple, Callable
 from concurrent.futures import ThreadPoolExecutor, Future
 import numpy as np
@@ -14,7 +15,7 @@ import threading
 def ensure_deps() -> None:
     try:
         import importlib.util as _iu
-        need = ["numpy", "PIL", "moviepy", "PySide6"]
+        need = ["numpy", "PIL", "moviepy", "PySide6", "cv2"]
         for name in need:
             if _iu.find_spec(name) is None:
                 raise RuntimeError("missing")
@@ -35,6 +36,7 @@ def ensure_deps() -> None:
                 "numpy>=1.21.0",
                 "imageio-ffmpeg>=0.4.8",
                 "PySide6>=6.5.0",
+                "opencv-python-headless>=4.8.0",
             ]
         subprocess.run(cmd, check=True)
         importlib.invalidate_caches()
@@ -43,9 +45,116 @@ def ensure_deps() -> None:
 ensure_deps()
 
 from PIL import Image, ImageFilter
+import cv2
 from moviepy.editor import VideoFileClip
 from moviepy.video.io.ffmpeg_writer import FFMPEG_VideoWriter
 import imageio_ffmpeg as iio_ffmpeg
+from PIL import ImageDraw, ImageFont, ImageFont
+import subprocess as _sub
+
+
+def normalize_nvenc_preset(preset: str) -> str:
+    """Map NVENC preset aliases to values supported by older ffmpeg builds.
+
+    Accepts p1..p7 (newer ffmpeg) and maps to older tokens; if unsupported, fallback to 'medium'.
+    """
+    if not preset:
+        return "medium"
+    p = str(preset).strip().lower()
+    # Allowed legacy presets
+    legacy_allowed = {
+        "default",
+        "slow",
+        "medium",
+        "fast",
+        "hp",
+        "hq",
+        "bd",
+        "ll",
+        "llhq",
+        "llhp",
+        "lossless",
+        "losslesshp",
+    }
+    if p in legacy_allowed:
+        return p
+    # Map p1..p7 to reasonable legacy equivalents
+    p_map = {
+        "p1": "hp",        # fastest
+        "p2": "fast",
+        "p3": "medium",
+        "p4": "default",
+        "p5": "hq",
+        "p6": "bd",
+        "p7": "slow",      # highest quality
+    }
+    return p_map.get(p, "medium")
+
+
+def can_use_nvenc() -> bool:
+    """Return True if ffmpeg can actually encode with h264_nvenc at runtime.
+
+    Some builds list the encoder but fail at runtime (e.g., missing nvcuda.dll).
+    We probe by attempting a tiny encode to the null muxer.
+    """
+    try:
+        ffmpeg_path = iio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        ffmpeg_path = None
+    if not ffmpeg_path or not os.path.exists(ffmpeg_path):
+        return False
+    try:
+        # Tiny 16x16, 0.05s color source, encode with h264_nvenc, discard output
+        # Cross-platform null sink: use '-' with null muxer
+        cmd = [
+            ffmpeg_path,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=16x16:d=0.05",
+            "-c:v",
+            "h264_nvenc",
+            "-f",
+            "null",
+            "-",
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
+def can_use_amf() -> bool:
+    """Return True if ffmpeg can encode with h264_amf (AMD) at runtime."""
+    try:
+        ffmpeg_path = iio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        ffmpeg_path = None
+    if not ffmpeg_path or not os.path.exists(ffmpeg_path):
+        return False
+    try:
+        cmd = [
+            ffmpeg_path,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=16x16:d=0.05",
+            "-c:v",
+            "h264_amf",
+            "-f",
+            "null",
+            "-",
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return res.returncode == 0
+    except Exception:
+        return False
 
 
 def shift_channel(arr: np.ndarray, dx: int, dy: int) -> np.ndarray:
@@ -88,6 +197,258 @@ def make_vignette(h: int, w: int, strength: float) -> np.ndarray:
     return v
 
 
+def apply_color_adjustments(
+    img: np.ndarray,
+    brightness: float,
+    contrast: float,
+    gamma: float,
+    saturation: float,
+    temperature: float,
+) -> np.ndarray:
+    # Saturation
+    if saturation != 1.0:
+        luma = 0.2126 * img[:, :, 0] + 0.7152 * img[:, :, 1] + 0.0722 * img[:, :, 2]
+        img = np.clip(luma[:, :, None] + (img - luma[:, :, None]) * float(saturation), 0.0, 1.0)
+    # Temperature: warm/cool via R/B gains
+    if temperature != 0.0:
+        t = float(temperature)
+        r_gain = float(np.clip(1.0 + 0.5 * t, 0.5, 1.5))
+        b_gain = float(np.clip(1.0 - 0.5 * t, 0.5, 1.5))
+        img[:, :, 0] = np.clip(img[:, :, 0] * r_gain, 0.0, 1.0)
+        img[:, :, 2] = np.clip(img[:, :, 2] * b_gain, 0.0, 1.0)
+    # Brightness/contrast
+    if brightness != 0.0 or contrast != 1.0:
+        img = np.clip((img - 0.5) * float(contrast) + 0.5 + float(brightness), 0.0, 1.0)
+    # Gamma
+    if gamma != 1.0 and gamma > 0.0:
+        inv_g = 1.0 / float(gamma)
+        img = np.clip(np.power(img, inv_g, dtype=np.float32), 0.0, 1.0)
+    return img
+
+
+def make_scanline_mask_2d(
+    h: int,
+    w: int,
+    strength: float,
+    period_px: float,
+    phase_px: float,
+    angle_deg: float,
+    thickness: float,
+) -> np.ndarray:
+    if strength <= 0.0:
+        return np.ones((h, w), dtype=np.float32)
+    yy, xx = np.mgrid[0:h, 0:w]
+    theta = np.deg2rad(float(angle_deg))
+    slanted = yy + np.tan(theta) * xx
+    omega = 2.0 * np.pi / max(1e-6, float(period_px))
+    s = 0.5 * (1.0 + np.sin(omega * (slanted + float(phase_px))))
+    # thickness maps to sharpness: >1 widens bright bands, <1 narrows
+    sharp = np.clip(float(thickness), 0.1, 4.0)
+    s_shaped = np.power(s, 1.0 / sharp)
+    mask = 1.0 - float(strength) * s_shaped
+    return mask.astype(np.float32)
+
+
+def apply_barrel_warp(img: np.ndarray, strength: float) -> np.ndarray:
+    s = float(strength)
+    if s == 0.0:
+        return img
+    h, w = img.shape[:2]
+    cx = (w - 1) / 2.0
+    cy = (h - 1) / 2.0
+    x = (np.arange(w, dtype=np.float32) - cx) / max(1.0, cx)
+    y = (np.arange(h, dtype=np.float32) - cy) / max(1.0, cy)
+    xv, yv = np.meshgrid(x, y)
+    r2 = xv * xv + yv * yv
+    k = s * 0.5  # scale factor
+    # radial barrel distortion: r' = r * (1 + k*r^2)
+    factor = 1.0 + k * r2
+    map_x = (xv * factor * cx + cx).astype(np.float32)
+    map_y = (yv * factor * cy + cy).astype(np.float32)
+    warped = cv2.remap(img, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    return warped
+
+
+def _parse_hex_color(s: str) -> Tuple[int, int, int]:
+    try:
+        st = s.strip()
+        if st.startswith("#"):
+            st = st[1:]
+        if len(st) == 6:
+            r = int(st[0:2], 16)
+            g = int(st[2:4], 16)
+            b = int(st[4:6], 16)
+            return r, g, b
+    except Exception:
+        pass
+    return 255, 255, 255
+
+
+def _make_text_overlay_rgba(w: int, h: int, text: str, font_family: str, size: int, color_hex: str, pos: Tuple[int, int]) -> np.ndarray:
+    if not text:
+        return np.zeros((h, w, 4), dtype=np.uint8)
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    font = None
+    # First try: if a file path was provided
+    if font_family and (os.path.isfile(font_family)):
+        try:
+            font = ImageFont.truetype(font_family, size)
+        except Exception:
+            font = None
+    # Second: try common Windows fonts mapped from family
+    if font is None:
+        candidates = []
+        fam = (font_family or "").lower()
+        win_dir = os.environ.get("WINDIR", "C:\\Windows")
+        fonts_dir = os.path.join(win_dir, "Fonts")
+        # Map some known families to TTF
+        mapping = {
+            "arial": "arial.ttf",
+            "segoe ui": "segoeui.ttf",
+            "consolas": "consola.ttf",
+            "tahoma": "tahoma.ttf",
+            "times new roman": "times.ttf",
+            "courier new": "cour.ttf",
+        }
+        if fam in mapping:
+            candidates.append(os.path.join(fonts_dir, mapping[fam]))
+        # Also try raw family + .ttf
+        if fam:
+            candidates.append(os.path.join(fonts_dir, f"{fam}.ttf"))
+        for path in candidates:
+            try:
+                if os.path.isfile(path):
+                    font = ImageFont.truetype(path, size)
+                    break
+            except Exception:
+                font = None
+    # Fallbacks
+    if font is None:
+        try:
+            font = ImageFont.truetype("arial.ttf", size)
+        except Exception:
+            font = ImageFont.load_default()
+    r, g, b = _parse_hex_color(color_hex)
+    x, y = int(pos[0]), int(pos[1])
+    draw.text((x, y), text, font=font, fill=(r, g, b, 255))
+    return np.asarray(img, dtype=np.uint8)
+
+
+def _make_text_overlay_rgba_qt(w: int, h: int, text: str, font_family: str, size_px: int, color_hex: str, pos: Tuple[int, int]) -> np.ndarray:
+    try:
+        from PySide6 import QtGui, QtCore
+    except Exception:
+        # Fallback to PIL path if Qt not available
+        return _make_text_overlay_rgba(w, h, text, font_family, size_px, color_hex, pos)
+    img = QtGui.QImage(w, h, QtGui.QImage.Format_RGBA8888)
+    img.fill(QtCore.Qt.transparent)
+    painter = QtGui.QPainter(img)
+    try:
+        painter.setRenderHints(QtGui.QPainter.Antialiasing | QtGui.QPainter.TextAntialiasing | QtGui.QPainter.SmoothPixmapTransform, True)
+        # Resolve font: accept direct file path or family name
+        resolved_family = None
+        if font_family and os.path.isfile(font_family):
+            try:
+                from PySide6 import QtGui as _QtGui
+                fid = _QtGui.QFontDatabase.addApplicationFont(font_family)
+                fams = _QtGui.QFontDatabase.applicationFontFamilies(fid) if fid >= 0 else []
+                if fams:
+                    resolved_family = fams[0]
+            except Exception:
+                resolved_family = None
+        if not resolved_family and font_family:
+            resolved_family = font_family
+        font = QtGui.QFont(resolved_family) if resolved_family else QtGui.QFont()
+        # Use pixel size for consistency with preview/export coords
+        font.setPixelSize(int(max(1, size_px)))
+        painter.setFont(font)
+        r, g, b = _parse_hex_color(color_hex)
+        painter.setPen(QtGui.QColor(int(r), int(g), int(b), 255))
+        x, y = int(pos[0]), int(pos[1])
+        painter.drawText(x, y + int(font.pixelSize() or size_px), text)
+    finally:
+        painter.end()
+    # Extract pixel data; QImage rows may be padded, so respect bytesPerLine
+    bpl = int(img.bytesPerLine())
+    mv = img.bits()
+    try:
+        buf = mv.tobytes()
+    except AttributeError:
+        # Fallback for older bindings
+        buf = bytes(mv)
+    arr = np.frombuffer(buf, dtype=np.uint8)
+    # Guard against incomplete buffers
+    expected = bpl * h
+    if arr.size < expected:
+        arr = np.pad(arr, (0, max(0, expected - arr.size)))
+    arr = arr.reshape((h, bpl // 4, 4))
+    arr = arr[:, :w, :]
+    return arr.copy()
+
+
+class FFmpegRawReader:
+    def __init__(self, src_path: str, out_w: int, out_h: int, fps: int, hwaccel: Optional[str] = None) -> None:
+        self.src_path = src_path
+        self.out_w = int(out_w)
+        self.out_h = int(out_h)
+        self.fps = int(max(1, fps))
+        self.hwaccel = hwaccel
+        self.proc = None
+        self._start()
+
+    def _start(self) -> None:
+        ffmpeg = iio_ffmpeg.get_ffmpeg_exe()
+        cmd = [ffmpeg, "-hide_banner", "-loglevel", "error"]
+        if self.hwaccel and self.hwaccel != "auto":
+            cmd += ["-hwaccel", self.hwaccel]
+        cmd += [
+            "-i", self.src_path,
+            "-vf", f"scale={self.out_w}:{self.out_h}",
+            "-r", str(self.fps),
+            "-f", "rawvideo",
+            "-pix_fmt", "rgb24",
+            "-",
+        ]
+        self.proc = _sub.Popen(cmd, stdout=_sub.PIPE, stderr=_sub.PIPE)
+
+    def iter_frames(self):
+        assert self.proc is not None and self.proc.stdout is not None
+        frame_size = self.out_w * self.out_h * 3
+        while True:
+            buf = self.proc.stdout.read(frame_size)
+            if not buf or len(buf) < frame_size:
+                break
+            arr = np.frombuffer(buf, dtype=np.uint8)
+            yield arr.reshape((self.out_h, self.out_w, 3))
+
+    def close(self) -> None:
+        if self.proc is not None:
+            try:
+                if self.proc.stdout:
+                    self.proc.stdout.close()
+                if self.proc.stderr:
+                    self.proc.stderr.close()
+                self.proc.terminate()
+            except Exception:
+                pass
+            self.proc = None
+
+
+def _map_decoder_to_hwaccel(pref: str) -> Optional[str]:
+    p = (pref or "auto").strip().lower()
+    if p in ("", "auto"):
+        return None
+    if p == "nvidia":
+        return "cuda"
+    if p == "amd":
+        return "dxva2"  # or d3d11va on newer builds
+    if p == "intel":
+        return "d3d11va"
+    if p == "cpu":
+        return None
+    return None
+
 def apply_crt_effect(
     frame: np.ndarray,
     scanline_strength: float,
@@ -95,6 +456,7 @@ def apply_crt_effect(
     aberration_px: int,
     bloom_sigma: float,
     bloom_strength: float,
+    bloom_threshold: float,
     noise_strength: float,
     vignette_mask: Optional[np.ndarray],
     persistence: float,
@@ -105,6 +467,20 @@ def apply_crt_effect(
     pixel_size: int,
     glitch_amp_px: int = 0,
     glitch_height_frac: float = 0.0,
+    time_sec: float = 0.0,
+    brightness: float = 0.0,
+    contrast: float = 1.0,
+    gamma: float = 1.0,
+    saturation: float = 1.0,
+    temperature: float = 0.0,
+    flicker_strength: float = 0.0,
+    flicker_hz: float = 0.0,
+    grain_size: int = 1,
+    scanline_angle: float = 0.0,
+    scanline_thickness: float = 1.0,
+    warp_strength: float = 0.0,
+    text_overlay_rgba: Optional[np.ndarray] = None,
+    text_overlay_after: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
     h, w = frame.shape[0], frame.shape[1]
     img = frame.astype(np.float32) / 255.0
@@ -114,34 +490,73 @@ def apply_crt_effect(
         b = shift_channel(img[:, :, 2], -aberration_px, 0)
         img = np.stack([r, g, b], axis=2)
     if pixel_size > 1:
-        im_px = Image.fromarray(np.clip(img * 255.0, 0, 255).astype(np.uint8))
         sw = max(1, w // int(pixel_size))
         sh = max(1, h // int(pixel_size))
-        small = im_px.resize((sw, sh), Image.NEAREST)
-        big = small.resize((w, h), Image.NEAREST)
-        img = np.asarray(big).astype(np.float32) / 255.0
+        img = cv2.resize(img, (sw, sh), interpolation=cv2.INTER_NEAREST)
+        img = cv2.resize(img, (w, h), interpolation=cv2.INTER_NEAREST)
+    # Color adjustments prior to bloom
+    img = apply_color_adjustments(img, brightness, contrast, gamma, saturation, temperature)
+    # Text overlay before effects
+    if text_overlay_rgba is not None and not text_overlay_after:
+        ov = text_overlay_rgba
+        if ov.dtype != np.uint8:
+            ov = np.clip(ov, 0, 255).astype(np.uint8)
+        if ov.shape[0] != h or ov.shape[1] != w:
+            ov = np.asarray(Image.fromarray(ov, mode="RGBA").resize((w, h), Image.BILINEAR))
+        alpha = (ov[:, :, 3:4].astype(np.float32)) / 255.0
+        rgb = ov[:, :, :3].astype(np.float32) / 255.0
+        img = np.clip(img * (1.0 - alpha) + rgb * alpha, 0.0, 1.0)
     if bloom_strength > 0.0 and (bloom_sigma > 0.0 or fast_bloom):
+        src = img
+        if bloom_threshold > 0.0:
+            thr = float(min(0.99, max(0.0, bloom_threshold)))
+            src = np.clip((img - thr) / max(1e-6, (1.0 - thr)), 0.0, 1.0)
         if fast_bloom:
-            im = Image.fromarray(np.clip(img * 255.0, 0, 255).astype(np.uint8))
-            ds = im.resize((max(1, w // 2), max(1, h // 2)), Image.BILINEAR)
-            us = ds.resize((w, h), Image.BILINEAR)
-            blurf = np.asarray(us).astype(np.float32) / 255.0
+            ds = cv2.resize(src, (max(1, w // 2), max(1, h // 2)), interpolation=cv2.INTER_LINEAR)
+            blurf = cv2.resize(ds, (w, h), interpolation=cv2.INTER_LINEAR)
         else:
-            im = Image.fromarray(np.clip(img * 255.0, 0, 255).astype(np.uint8))
-            blur = im.filter(ImageFilter.GaussianBlur(radius=bloom_sigma))
-            blurf = np.asarray(blur).astype(np.float32) / 255.0
+            k = max(1, int(round(bloom_sigma * 3)) * 2 + 1)
+            blurf = cv2.GaussianBlur(src, (k, k), sigmaX=bloom_sigma, sigmaY=bloom_sigma, borderType=cv2.BORDER_REPLICATE)
         img = np.clip(img + bloom_strength * blurf, 0.0, 1.0)
     if triad_mask is not None:
         img = np.clip(img * triad_mask, 0.0, 1.0)
     if scanline_strength > 0.0:
-        sl = make_scanline_mask_dynamic(h, scanline_strength, scanline_period_px, scanline_phase_px)
-        img = np.clip(img * sl[:, None], 0.0, 1.0)
+        if scanline_angle == 0.0 and scanline_thickness == 1.0:
+            sl = make_scanline_mask_dynamic(h, scanline_strength, scanline_period_px, scanline_phase_px)
+            img = np.clip(img * sl[:, None, None], 0.0, 1.0)
+        else:
+            sl2d = make_scanline_mask_2d(h, w, scanline_strength, scanline_period_px, scanline_phase_px, scanline_angle, scanline_thickness)
+            img = np.clip(img * sl2d[:, :, None], 0.0, 1.0)
     if vignette_mask is not None:
         img = np.clip(img * vignette_mask[:, :, None], 0.0, 1.0)
+    # Flicker modulation
+    if flicker_strength > 0.0 and flicker_hz > 0.0:
+        factor = 1.0 + 0.25 * float(flicker_strength) * np.sin(2.0 * np.pi * float(flicker_hz) * float(time_sec))
+        img = np.clip(img * factor, 0.0, 1.0)
+    # Grain/noise
     if noise_strength > 0.0:
-        noise = np.random.standard_normal(size=img.shape[:2]).astype(np.float32)
-        noise = noise * noise_strength / 255.0
+        if grain_size and grain_size > 1:
+            gh = max(1, h // int(grain_size))
+            gw = max(1, w // int(grain_size))
+            small_noise = np.random.standard_normal(size=(gh, gw)).astype(np.float32)
+            noise = cv2.resize(small_noise, (w, h), interpolation=cv2.INTER_LINEAR)
+        else:
+            noise = np.random.standard_normal(size=img.shape[:2]).astype(np.float32)
+        noise = noise * (noise_strength / 255.0)
         img = np.clip(img + noise[:, :, None], 0.0, 1.0)
+    # Warp at end for better edges
+    if warp_strength != 0.0:
+        img = apply_barrel_warp(img, warp_strength)
+    # Text overlay after effects
+    if text_overlay_rgba is not None and text_overlay_after:
+        ov = text_overlay_rgba
+        if ov.dtype != np.uint8:
+            ov = np.clip(ov, 0, 255).astype(np.uint8)
+        if ov.shape[0] != h or ov.shape[1] != w:
+            ov = np.asarray(Image.fromarray(ov, mode="RGBA").resize((w, h), Image.BILINEAR))
+        alpha = (ov[:, :, 3:4].astype(np.float32)) / 255.0
+        rgb = ov[:, :, :3].astype(np.float32) / 255.0
+        img = np.clip(img * (1.0 - alpha) + rgb * alpha, 0.0, 1.0)
     if glitch_amp_px > 0 and glitch_height_frac > 0.0:
         h2, w2 = img.shape[0], img.shape[1]
         y0 = max(0, min(h2, h2 - int(h2 * glitch_height_frac)))
@@ -182,6 +597,7 @@ def apply_static_effects(
     aberration_px: int,
     bloom_sigma: float,
     bloom_strength: float,
+    bloom_threshold: float,
     noise_strength: float,
     vignette_mask: Optional[np.ndarray],
     scanline_period_px: float,
@@ -190,6 +606,20 @@ def apply_static_effects(
     pixel_size: int,
     glitch_amp_px: int,
     glitch_height_frac: float,
+    time_sec: float = 0.0,
+    brightness: float = 0.0,
+    contrast: float = 1.0,
+    gamma: float = 1.0,
+    saturation: float = 1.0,
+    temperature: float = 0.0,
+    flicker_strength: float = 0.0,
+    flicker_hz: float = 0.0,
+    grain_size: int = 1,
+    scanline_angle: float = 0.0,
+    scanline_thickness: float = 1.0,
+    warp_strength: float = 0.0,
+    text_overlay_rgba: Optional[np.ndarray] = None,
+    text_overlay_after: bool = True,
 ) -> np.ndarray:
     h, w = frame.shape[0], frame.shape[1]
     img = frame.astype(np.float32) / 255.0
@@ -199,34 +629,69 @@ def apply_static_effects(
         b = shift_channel(img[:, :, 2], -aberration_px, 0)
         img = np.stack([r, g, b], axis=2)
     if pixel_size > 1:
-        im_px = Image.fromarray(np.clip(img * 255.0, 0, 255).astype(np.uint8))
         sw = max(1, w // int(pixel_size))
         sh = max(1, h // int(pixel_size))
-        small = im_px.resize((sw, sh), Image.NEAREST)
-        big = small.resize((w, h), Image.NEAREST)
-        img = np.asarray(big).astype(np.float32) / 255.0
+        img = cv2.resize(img, (sw, sh), interpolation=cv2.INTER_NEAREST)
+        img = cv2.resize(img, (w, h), interpolation=cv2.INTER_NEAREST)
+    img = apply_color_adjustments(img, brightness, contrast, gamma, saturation, temperature)
+    # Text overlay before effects
+    if text_overlay_rgba is not None and not text_overlay_after:
+        ov = text_overlay_rgba
+        if ov.dtype != np.uint8:
+            ov = np.clip(ov, 0, 255).astype(np.uint8)
+        if ov.shape[0] != h or ov.shape[1] != w:
+            ov = np.asarray(Image.fromarray(ov, mode="RGBA").resize((w, h), Image.BILINEAR))
+        alpha = (ov[:, :, 3:4].astype(np.float32)) / 255.0
+        rgb = ov[:, :, :3].astype(np.float32) / 255.0
+        img = np.clip(img * (1.0 - alpha) + rgb * alpha, 0.0, 1.0)
     if bloom_strength > 0.0 and (bloom_sigma > 0.0 or fast_bloom):
+        src = img
+        if bloom_threshold > 0.0:
+            thr = float(min(0.99, max(0.0, bloom_threshold)))
+            src = np.clip((img - thr) / max(1e-6, (1.0 - thr)), 0.0, 1.0)
         if fast_bloom:
-            im = Image.fromarray(np.clip(img * 255.0, 0, 255).astype(np.uint8))
-            ds = im.resize((max(1, w // 2), max(1, h // 2)), Image.BILINEAR)
-            us = ds.resize((w, h), Image.BILINEAR)
-            blurf = np.asarray(us).astype(np.float32) / 255.0
+            ds = cv2.resize(src, (max(1, w // 2), max(1, h // 2)), interpolation=cv2.INTER_LINEAR)
+            blurf = cv2.resize(ds, (w, h), interpolation=cv2.INTER_LINEAR)
         else:
-            im = Image.fromarray(np.clip(img * 255.0, 0, 255).astype(np.uint8))
-            blur = im.filter(ImageFilter.GaussianBlur(radius=bloom_sigma))
-            blurf = np.asarray(blur).astype(np.float32) / 255.0
+            k = max(1, int(round(bloom_sigma * 3)) * 2 + 1)
+            blurf = cv2.GaussianBlur(src, (k, k), sigmaX=bloom_sigma, sigmaY=bloom_sigma, borderType=cv2.BORDER_REPLICATE)
         img = np.clip(img + bloom_strength * blurf, 0.0, 1.0)
     if triad_mask is not None:
         img = np.clip(img * triad_mask, 0.0, 1.0)
     if scanline_strength > 0.0:
-        sl = make_scanline_mask_dynamic(h, scanline_strength, scanline_period_px, scanline_phase_px)
-        img = np.clip(img * sl[:, None], 0.0, 1.0)
+        if scanline_angle == 0.0 and scanline_thickness == 1.0:
+            sl = make_scanline_mask_dynamic(h, scanline_strength, scanline_period_px, scanline_phase_px)
+            img = np.clip(img * sl[:, None, None], 0.0, 1.0)
+        else:
+            sl2d = make_scanline_mask_2d(h, w, scanline_strength, scanline_period_px, scanline_phase_px, scanline_angle, scanline_thickness)
+            img = np.clip(img * sl2d[:, :, None], 0.0, 1.0)
     if vignette_mask is not None:
         img = np.clip(img * vignette_mask[:, :, None], 0.0, 1.0)
+    if flicker_strength > 0.0 and flicker_hz > 0.0:
+        factor = 1.0 + 0.25 * float(flicker_strength) * np.sin(2.0 * np.pi * float(flicker_hz) * float(time_sec))
+        img = np.clip(img * factor, 0.0, 1.0)
     if noise_strength > 0.0:
-        noise = np.random.standard_normal(size=img.shape[:2]).astype(np.float32)
-        noise = noise * noise_strength / 255.0
+        if grain_size and grain_size > 1:
+            gh = max(1, h // int(grain_size))
+            gw = max(1, w // int(grain_size))
+            small_noise = np.random.standard_normal(size=(gh, gw)).astype(np.float32)
+            noise = cv2.resize(small_noise, (w, h), interpolation=cv2.INTER_LINEAR)
+        else:
+            noise = np.random.standard_normal(size=img.shape[:2]).astype(np.float32)
+        noise = noise * (noise_strength / 255.0)
         img = np.clip(img + noise[:, :, None], 0.0, 1.0)
+    if warp_strength != 0.0:
+        img = apply_barrel_warp(img, warp_strength)
+    # Text overlay after effects
+    if text_overlay_rgba is not None and text_overlay_after:
+        ov = text_overlay_rgba
+        if ov.dtype != np.uint8:
+            ov = np.clip(ov, 0, 255).astype(np.uint8)
+        if ov.shape[0] != h or ov.shape[1] != w:
+            ov = np.asarray(Image.fromarray(ov, mode="RGBA").resize((w, h), Image.BILINEAR))
+        alpha = (ov[:, :, 3:4].astype(np.float32)) / 255.0
+        rgb = ov[:, :, :3].astype(np.float32) / 255.0
+        img = np.clip(img * (1.0 - alpha) + rgb * alpha, 0.0, 1.0)
     if glitch_amp_px > 0 and glitch_height_frac > 0.0:
         h2, w2 = img.shape[0], img.shape[1]
         y0 = max(0, min(h2, h2 - int(h2 * glitch_height_frac)))
@@ -276,6 +741,26 @@ def process_video(
     nvenc_preset: str,
     glitch_amp_px: int = 0,
     glitch_height_frac: float = 0.0,
+    encoder_preference: str = "auto",
+    decoder_preference: str = "auto",
+    bloom_threshold: float = 0.0,
+    brightness: float = 0.0,
+    contrast: float = 1.0,
+    gamma: float = 1.0,
+    saturation: float = 1.0,
+    temperature: float = 0.0,
+    flicker_strength: float = 0.0,
+    flicker_hz: float = 0.0,
+    grain_size: int = 1,
+    scanline_angle: float = 0.0,
+    scanline_thickness: float = 1.0,
+    warp_strength: float = 0.0,
+    text: str = "",
+    text_font: str = "",
+    text_size: int = 36,
+    text_color: str = "#FFFFFF",
+    text_pos: Tuple[int, int] = (32, 32),
+    text_after: bool = True,
     progress_cb: Optional[Callable[[float], None]] = None,
 ) -> bool:
     clip = VideoFileClip(str(input_path))
@@ -295,14 +780,39 @@ def process_video(
             tmp_path = tmp.name
             tmp.close()
             try:
-                clip.audio.write_audiofile(tmp_path, fps=44100, nbytes=2, codec="aac", verbose=False, logger=None)
+                # quicker audio write
+                clip.audio.write_audiofile(tmp_path, fps=44100, nbytes=2, codec="aac", bitrate="128k", verbose=False, logger=None)
                 audio_path = tmp_path
             except Exception:
                 audio_path = None
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        codec = "h264_nvenc" if gpu else "libx264"
-        used_gpu = codec == "h264_nvenc"
-        ffparams = (["-cq", str(crf), "-preset", str(nvenc_preset), "-pix_fmt", "yuv420p"] if used_gpu else ["-crf", str(crf), "-pix_fmt", "yuv420p"])
+        # Choose codec based on preference and availability
+        pref = (encoder_preference or "auto").strip().lower()
+        requested_gpu = bool(gpu)
+        codec = "libx264"
+        if pref == "nvidia":
+            codec = "h264_nvenc" if can_use_nvenc() else "libx264"
+        elif pref == "amd":
+            codec = "h264_amf" if can_use_amf() else "libx264"
+        elif pref == "cpu":
+            codec = "libx264"
+        else:  # auto
+            if requested_gpu and can_use_nvenc():
+                codec = "h264_nvenc"
+            elif requested_gpu and can_use_amf():
+                codec = "h264_amf"
+            else:
+                codec = "libx264"
+        used_gpu = codec in ("h264_nvenc", "h264_amf")
+        # Build ffmpeg params per codec
+        if codec == "h264_nvenc":
+            nv_preset = normalize_nvenc_preset(nvenc_preset)
+            ffparams = ["-cq", str(crf), "-preset", nv_preset, "-pix_fmt", "yuv420p"]
+        elif codec == "h264_amf":
+            # Keep minimal flags for broad compatibility
+            ffparams = ["-pix_fmt", "yuv420p"]
+        else:
+            ffparams = ["-crf", str(crf), "-pix_fmt", "yuv420p"]
         writer_kwargs = dict(
             filename=str(output_path),
             size=(out_w, out_h),
@@ -315,14 +825,29 @@ def process_video(
         if not used_gpu:
             writer_kwargs["preset"] = "medium"
         writer = FFMPEG_VideoWriter(**writer_kwargs)
-        max_workers = max(os.cpu_count() - 2, 1)
-        queue_cap = max_workers * 4
+        max_workers = max((os.cpu_count() or 4) - 1, 1)
+        queue_cap = max_workers * 6
         executor = ThreadPoolExecutor(max_workers=max_workers)
         futures = {}
         next_write = 0
         prev_state = None
         i = 0
-        for frame in clip.iter_frames(fps=fps_out, dtype="uint8"):
+        # Optional hardware-accelerated decode via ffmpeg raw reader
+        hw_reader = None
+        def _open_hw_reader() -> Optional[object]:
+            accel = _map_decoder_to_hwaccel(decoder_preference)
+            if accel is None:
+                return None
+            try:
+                return FFmpegRawReader(str(input_path), out_w, out_h, fps_out, accel)
+            except Exception:
+                return None
+        hw_reader = _open_hw_reader()
+        if hw_reader is not None:
+            frame_iter = hw_reader.iter_frames()
+        else:
+            frame_iter = clip.iter_frames(fps=fps_out, dtype="uint8")
+        for frame in frame_iter:
             if frame.shape[1] != out_w or frame.shape[0] != out_h:
                 im = Image.fromarray(frame)
                 frame = np.asarray(im.resize((out_w, out_h), Image.BILINEAR))
@@ -336,6 +861,7 @@ def process_video(
                     aberration_px,
                     bloom_sigma,
                     bloom_strength,
+                    float(bloom_threshold),
                     noise_strength,
                     vignette_mask,
                     scanline_period_px,
@@ -344,6 +870,20 @@ def process_video(
                     pixel_size,
                     int(glitch_amp_px),
                     float(glitch_height_frac),
+                    time_sec=(idx / float(fps_out)),
+                    brightness=float(brightness),
+                    contrast=float(contrast),
+                    gamma=float(gamma),
+                    saturation=float(saturation),
+                    temperature=float(temperature),
+                    flicker_strength=float(flicker_strength),
+                    flicker_hz=float(flicker_hz),
+                    grain_size=int(grain_size),
+                    scanline_angle=float(scanline_angle),
+                    scanline_thickness=float(scanline_thickness),
+                    warp_strength=float(warp_strength),
+                    text_overlay_rgba=_make_text_overlay_rgba_qt(out_w, out_h, text, text_font, text_size, text_color, text_pos) if text else None,
+                    text_overlay_after=bool(text_after),
                 )
             futures[i] = submit_job(i, frame, phase)
             i += 1
@@ -383,6 +923,11 @@ def process_video(
             if progress_cb is not None:
                 progress_cb(min(1.0, next_write / float(total_frames)))
         writer.close()
+        if hw_reader is not None:
+            try:
+                hw_reader.close()
+            except Exception:
+                pass
         executor.shutdown(wait=True)
         if audio_path and os.path.exists(audio_path):
             try:
@@ -408,6 +953,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--aberration-px", type=int, default=1)
     p.add_argument("--bloom-sigma", type=float, default=1.2)
     p.add_argument("--bloom-strength", type=float, default=0.25)
+    p.add_argument("--bloom-threshold", type=float, default=0.0)
     p.add_argument("--noise-strength", type=float, default=1.5)
     p.add_argument("--vignette-strength", type=float, default=0.25)
     p.add_argument("--persistence", type=float, default=0.2)
@@ -418,8 +964,30 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-fast-bloom", dest="fast_bloom", action="store_false")
     p.set_defaults(fast_bloom=True)
     p.add_argument("--pixel-size", type=int, default=2)
+    # Advanced
+    p.add_argument("--brightness", type=float, default=0.0)
+    p.add_argument("--contrast", type=float, default=1.0)
+    p.add_argument("--gamma", type=float, default=1.0)
+    p.add_argument("--saturation", type=float, default=1.0)
+    p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--flicker-strength", type=float, default=0.0)
+    p.add_argument("--flicker-hz", type=float, default=0.0)
+    p.add_argument("--grain-size", type=int, default=1)
+    p.add_argument("--scanline-angle", type=float, default=0.0)
+    p.add_argument("--scanline-thickness", type=float, default=1.0)
+    p.add_argument("--warp-strength", type=float, default=0.0)
+    # Text overlay
+    p.add_argument("--text", type=str, default="")
+    p.add_argument("--text-font", type=str, default="")
+    p.add_argument("--text-size", type=int, default=36)
+    p.add_argument("--text-color", type=str, default="#FFFFFF")
+    p.add_argument("--text-x", type=int, default=32)
+    p.add_argument("--text-y", type=int, default=32)
+    p.add_argument("--text-after", action="store_true")
     p.add_argument("--gpu", action="store_true")
     p.add_argument("--nvenc-preset", type=str, default="p4")
+    p.add_argument("--encoder", type=str, default="auto", choices=["auto", "nvidia", "amd", "cpu"])
+    p.add_argument("--decoder", type=str, default="auto", choices=["auto", "nvidia", "amd", "intel", "cpu"])
     p.add_argument("--glitch-amp", type=int, default=0)
     p.add_argument("--glitch-height", type=float, default=0.0)
     p.add_argument("--gui", action="store_true")
@@ -458,12 +1026,100 @@ def main() -> None:
         nvenc_preset=str(a.nvenc_preset),
         glitch_amp_px=max(0, int(a.glitch_amp)),
         glitch_height_frac=float(max(0.0, min(1.0, a.glitch_height))),
+        encoder_preference=str(a.encoder),
+        decoder_preference=str(a.decoder),
+        bloom_threshold=float(max(0.0, min(1.0, a.bloom_threshold))),
+        brightness=float(a.brightness),
+        contrast=float(a.contrast),
+        gamma=float(max(1e-3, a.gamma)),
+        saturation=float(max(0.0, a.saturation)),
+        temperature=float(max(-1.0, min(1.0, a.temperature))),
+        flicker_strength=float(max(0.0, min(1.0, a.flicker_strength))),
+        flicker_hz=float(max(0.0, a.flicker_hz)),
+        grain_size=max(1, int(a.grain_size)),
+        scanline_angle=float(a.scanline_angle),
+        scanline_thickness=float(max(0.1, a.scanline_thickness)),
+        warp_strength=float(max(-1.0, min(1.0, a.warp_strength))),
+        text=str(a.text),
+        text_font=str(a.text_font),
+        text_size=int(a.text_size),
+        text_color=str(a.text_color),
+        text_pos=(int(a.text_x), int(a.text_y)),
+        text_after=bool(a.text_after),
     )
-    print("GPU NVENC used" if used_gpu else "CPU x264 used")
+    print("Hardware encoder used" if used_gpu else "CPU x264 used")
 
 
 def launch_gui() -> None:
     from PySide6 import QtCore, QtGui, QtWidgets
+
+    class HWPreviewReader:
+        def __init__(self, path: Path, width: int, height: int, fps: int) -> None:
+            self.path = str(path)
+            self.width = int(width)
+            self.height = int(height)
+            self.fps = int(max(1, fps))
+            self.cap = None
+            self.running = False
+
+        def start(self) -> None:
+            self.stop()
+            self.running = True
+            # Try preferred hardware backends
+            cap = None
+            try:
+                cap = cv2.cudacodec.createVideoReader(self.path)  # type: ignore[attr-defined]
+            except Exception:
+                cap = None
+            if cap is not None:
+                self.cap = ("cuda", cap)
+                return
+            # Try D3D11/DXVA2 via FFmpeg filters using VideoCapture fallback
+            cap2 = cv2.VideoCapture(self.path, cv2.CAP_FFMPEG)
+            if cap2 is not None and cap2.isOpened():
+                # Set desired fps/size as hints; actual decode will be original, we will resize
+                self.cap = ("ffmpeg", cap2)
+                return
+            # Fallback to default VideoCapture
+            cap3 = cv2.VideoCapture(self.path)
+            if cap3 is not None and cap3.isOpened():
+                self.cap = ("default", cap3)
+            else:
+                self.cap = None
+
+        def stop(self) -> None:
+            if self.cap is not None:
+                kind, handle = self.cap
+                try:
+                    handle.release()
+                except Exception:
+                    pass
+            self.cap = None
+            self.running = False
+
+        def read_next(self) -> Optional[np.ndarray]:
+            if self.cap is None:
+                return None
+            kind, handle = self.cap
+            try:
+                if kind == "cuda":
+                    ok, gpu_mat = handle.nextFrame()  # returns GpuMat
+                    if not ok:
+                        return None
+                    frame = gpu_mat.download()
+                else:
+                    ok, frame = handle.read()
+                    if not ok:
+                        return None
+                if frame is None:
+                    return None
+                # Convert BGR->RGB and scale
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                if (frame.shape[1] != self.width) or (frame.shape[0] != self.height):
+                    frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
+                return frame.astype(np.uint8)
+            except Exception:
+                return None
 
     class ExportDialog(QtWidgets.QDialog):
         def __init__(self, parent: QtWidgets.QWidget, src: Path) -> None:
@@ -487,14 +1143,14 @@ def launch_gui() -> None:
             self.fps = QtWidgets.QSpinBox()
             self.fps.setRange(0, 240)
             self.fps.setValue(0)
-            self.gpu = QtWidgets.QCheckBox("Use GPU (NVENC)")
+            self.gpu = QtWidgets.QCheckBox("Use hardware encoder")
             self.gpu.setChecked(parent.gpu_cb.isChecked())
             form = QtWidgets.QFormLayout()
             form.addRow("output path", path_row)
             form.addRow("width (0 keep)", self.width)
             form.addRow("height (0 keep)", self.height)
             form.addRow("fps (0 keep)", self.fps)
-            form.addRow("gpu", self.gpu)
+            form.addRow("hardware encode", self.gpu)
             btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
             btns.accepted.connect(self.accept)
             btns.rejected.connect(self.reject)
@@ -523,7 +1179,9 @@ def launch_gui() -> None:
             self.resize(1160, 760)
             self.video_label = QtWidgets.QLabel()
             self.video_label.setAlignment(QtCore.Qt.AlignCenter)
-            self.video_label.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+            self.video_label.setScaledContents(False)
+            self.video_label.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Ignored)
+            self.video_label.setMinimumSize(1, 1)
             self.preview_frame = QtWidgets.QFrame()
             self.preview_frame.setObjectName("PreviewFrame")
             pf_layout = QtWidgets.QVBoxLayout(self.preview_frame)
@@ -534,9 +1192,36 @@ def launch_gui() -> None:
             shadow.setColor(QtGui.QColor(0, 0, 0, 200))
             shadow.setOffset(0, 8)
             self.preview_frame.setGraphicsEffect(shadow)
-            self.gpu_cb = QtWidgets.QCheckBox("GPU (NVENC)")
+            self.gpu_cb = QtWidgets.QCheckBox("Enable hardware encode")
+            self.encoder_choice = QtWidgets.QComboBox()
+            self.encoder_choice.addItems(["Auto", "NVIDIA", "AMD", "CPU"]) 
+            self.encoder_choice.setCurrentIndex(0)
             self.fast_bloom_cb = QtWidgets.QCheckBox("Fast Bloom")
             self.fast_bloom_cb.setChecked(True)
+            # Advanced FX controls
+            self.brightness = QtWidgets.QDoubleSpinBox(); self.brightness.setRange(-1.0, 1.0); self.brightness.setSingleStep(0.01); self.brightness.setValue(0.0)
+            self.contrast = QtWidgets.QDoubleSpinBox(); self.contrast.setRange(0.1, 3.0); self.contrast.setSingleStep(0.05); self.contrast.setValue(1.0)
+            self.gamma = QtWidgets.QDoubleSpinBox(); self.gamma.setRange(0.1, 5.0); self.gamma.setSingleStep(0.05); self.gamma.setValue(1.0)
+            self.saturation = QtWidgets.QDoubleSpinBox(); self.saturation.setRange(0.0, 3.0); self.saturation.setSingleStep(0.05); self.saturation.setValue(1.0)
+            self.temperature = QtWidgets.QDoubleSpinBox(); self.temperature.setRange(-1.0, 1.0); self.temperature.setSingleStep(0.05); self.temperature.setValue(0.0)
+            self.bloom_threshold = QtWidgets.QDoubleSpinBox(); self.bloom_threshold.setRange(0.0, 1.0); self.bloom_threshold.setSingleStep(0.01); self.bloom_threshold.setValue(0.0)
+            self.flicker_strength = QtWidgets.QDoubleSpinBox(); self.flicker_strength.setRange(0.0, 1.0); self.flicker_strength.setSingleStep(0.01); self.flicker_strength.setValue(0.0)
+            self.flicker_hz = QtWidgets.QDoubleSpinBox(); self.flicker_hz.setRange(0.0, 120.0); self.flicker_hz.setSingleStep(0.5); self.flicker_hz.setValue(0.0)
+            self.grain_size = QtWidgets.QSpinBox(); self.grain_size.setRange(1, 64); self.grain_size.setValue(1)
+            self.scanline_angle = QtWidgets.QDoubleSpinBox(); self.scanline_angle.setRange(-45.0, 45.0); self.scanline_angle.setSingleStep(0.5); self.scanline_angle.setValue(0.0)
+            self.scanline_thickness = QtWidgets.QDoubleSpinBox(); self.scanline_thickness.setRange(0.1, 4.0); self.scanline_thickness.setSingleStep(0.1); self.scanline_thickness.setValue(1.0)
+            self.warp_strength = QtWidgets.QDoubleSpinBox(); self.warp_strength.setRange(-1.0, 1.0); self.warp_strength.setSingleStep(0.05); self.warp_strength.setValue(0.0)
+            # Text overlay controls
+            self.text_input = QtWidgets.QLineEdit()
+            self.text_font_combo = QtWidgets.QFontComboBox()
+            # Show only scalable (TrueType/OpenType) fonts to avoid DirectWrite issues
+            self.text_font_combo.setFontFilters(QtWidgets.QFontComboBox.ScalableFonts)
+            self.text_size = QtWidgets.QSpinBox(); self.text_size.setRange(6, 256); self.text_size.setValue(36)
+            self.text_color = QtWidgets.QLineEdit("#FFFFFF")
+            self.text_x = QtWidgets.QSpinBox(); self.text_x.setRange(0, 10000); self.text_x.setValue(32)
+            self.text_y = QtWidgets.QSpinBox(); self.text_y.setRange(0, 10000); self.text_y.setValue(32)
+            self.text_after = QtWidgets.QCheckBox("Draw text after effects")
+            self.text_after.setChecked(True)
             self.scanline_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
             self.scanline_slider.setMinimum(0)
             self.scanline_slider.setMaximum(100)
@@ -619,14 +1304,23 @@ def launch_gui() -> None:
             motion_form.addRow("glitch height (0-1)", self.glitch_height)
             output_form = QtWidgets.QFormLayout()
             output_form.setLabelAlignment(QtCore.Qt.AlignRight)
-            output_form.addRow("gpu (nvenc)", self.gpu_cb)
+            output_form.addRow("hardware encode", self.gpu_cb)
+            output_form.addRow("encoder", self.encoder_choice)
+            self.decoder_choice = QtWidgets.QComboBox()
+            self.decoder_choice.addItems(["Auto", "NVIDIA", "AMD", "Intel", "CPU"]) 
+            self.decoder_choice.setCurrentIndex(0)
+            output_form.addRow("decoder", self.decoder_choice)
             output_form.addRow("fast bloom", self.fast_bloom_cb)
             output_form.addRow("crf/cq", self.crf_val)
             output_form.addRow("nvenc preset", self.nvenc_preset)
             self.render_btn = QtWidgets.QPushButton("Render")
             self.reset_btn = QtWidgets.QPushButton("Reset")
+            self.save_btn = QtWidgets.QPushButton("Save Preset")
+            self.load_btn = QtWidgets.QPushButton("Load Preset")
             out_buttons = QtWidgets.QHBoxLayout()
             out_buttons.addStretch(1)
+            out_buttons.addWidget(self.load_btn)
+            out_buttons.addWidget(self.save_btn)
             out_buttons.addWidget(self.reset_btn)
             out_buttons.addWidget(self.render_btn)
             output_col = QtWidgets.QVBoxLayout()
@@ -637,18 +1331,68 @@ def launch_gui() -> None:
             effects_tab.setLayout(effects_form)
             motion_tab = QtWidgets.QWidget()
             motion_tab.setLayout(motion_form)
+            adv_form = QtWidgets.QFormLayout()
+            adv_form.setLabelAlignment(QtCore.Qt.AlignRight)
+            adv_form.addRow("brightness", self.brightness)
+            adv_form.addRow("contrast", self.contrast)
+            adv_form.addRow("gamma", self.gamma)
+            adv_form.addRow("saturation", self.saturation)
+            adv_form.addRow("temperature", self.temperature)
+            adv_form.addRow("bloom threshold", self.bloom_threshold)
+            adv_form.addRow("flicker strength", self.flicker_strength)
+            adv_form.addRow("flicker hz", self.flicker_hz)
+            adv_form.addRow("grain size", self.grain_size)
+            adv_form.addRow("scanline angle", self.scanline_angle)
+            adv_form.addRow("scanline thickness", self.scanline_thickness)
+            adv_form.addRow("warp strength", self.warp_strength)
+            # Text: move to its own tab
+            text_form = QtWidgets.QFormLayout()
+            text_form.setLabelAlignment(QtCore.Qt.AlignRight)
+            text_form.addRow("text", self.text_input)
+            # Custom font file picker
+            self.text_font_path = QtWidgets.QLineEdit("")
+            self.text_font_path.setPlaceholderText("Optional: .ttf/.otf file path")
+            self.text_font_browse = QtWidgets.QPushButton("Browse Font…")
+            font_row = QtWidgets.QHBoxLayout()
+            font_row.addWidget(self.text_font_combo, 1)
+            font_row.addWidget(self.text_font_browse)
+            text_form.addRow("font", font_row)
+            text_form.addRow("font file", self.text_font_path)
+            text_form.addRow("text size", self.text_size)
+            text_form.addRow("text color (#RRGGBB)", self.text_color)
+            text_form.addRow("text x", self.text_x)
+            text_form.addRow("text y", self.text_y)
+            text_form.addRow("text after effects", self.text_after)
+            # Text preset save/load
+            self.text_save_btn = QtWidgets.QPushButton("Save Text Preset")
+            self.text_load_btn = QtWidgets.QPushButton("Load Text Preset")
+            text_btns = QtWidgets.QHBoxLayout()
+            text_btns.addStretch(1)
+            text_btns.addWidget(self.text_load_btn)
+            text_btns.addWidget(self.text_save_btn)
+            text_form.addRow(text_btns)
+            text_tab = QtWidgets.QWidget(); text_tab.setLayout(text_form)
+            adv_tab = QtWidgets.QWidget(); adv_tab.setLayout(adv_form)
             output_tab = QtWidgets.QWidget()
             output_tab.setLayout(output_col)
             tabs = QtWidgets.QTabWidget()
             tabs.addTab(effects_tab, "Effects")
             tabs.addTab(motion_tab, "Motion")
+            tabs.addTab(adv_tab, "Advanced")
+            tabs.addTab(text_tab, "Text")
             tabs.addTab(output_tab, "Output")
             splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
             splitter.setChildrenCollapsible(False)
             splitter.addWidget(self.preview_frame)
             splitter.addWidget(tabs)
-            splitter.setStretchFactor(0, 3)
-            splitter.setStretchFactor(1, 1)
+            # Lock the right-side tabs width so only the preview grows/shrinks
+            self.sidebar_width = 420
+            tabs.setFixedWidth(self.sidebar_width)
+            tabs.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Expanding)
+            splitter.setStretchFactor(0, 1)
+            splitter.setStretchFactor(1, 0)
+            # Initial sizes: left takes remaining space, right is fixed
+            splitter.setSizes([max(1, self.width() - self.sidebar_width - 48), self.sidebar_width])
             central = QtWidgets.QWidget()
             central_layout = QtWidgets.QHBoxLayout(central)
             central_layout.setContentsMargins(12, 12, 12, 12)
@@ -661,8 +1405,10 @@ def launch_gui() -> None:
             self.actOpen = QtGui.QAction(self.style().standardIcon(QtWidgets.QStyle.SP_DirOpenIcon), "Open", self)
             self.actPlay = QtGui.QAction(self.style().standardIcon(QtWidgets.QStyle.SP_MediaPlay), "Play", self)
             self.actRender = QtGui.QAction(self.style().standardIcon(QtWidgets.QStyle.SP_DialogSaveButton), "Render", self)
-            self.actGPU = QtGui.QAction("GPU", self)
+            self.actGPU = QtGui.QAction("HW Encode", self)
             self.actGPU.setCheckable(True)
+            self.actHWDec = QtGui.QAction("HW Decode", self)
+            self.actHWDec.setCheckable(True)
             self.actFast = QtGui.QAction("Fast Bloom", self)
             self.actFast.setCheckable(True)
             self.actFast.setChecked(True)
@@ -671,6 +1417,7 @@ def launch_gui() -> None:
             bar.addAction(self.actRender)
             bar.addSeparator()
             bar.addAction(self.actGPU)
+            bar.addAction(self.actHWDec)
             bar.addAction(self.actFast)
             self.status = self.statusBar()
             self.time_label = QtWidgets.QLabel("00:00 / 00:00")
@@ -686,6 +1433,7 @@ def launch_gui() -> None:
             self.actRender.triggered.connect(self.on_render)
             self.actGPU.toggled.connect(self.gpu_cb.setChecked)
             self.gpu_cb.toggled.connect(self.actGPU.setChecked)
+            self.actHWDec.toggled.connect(self.on_hwdec_toggle)
             self.actFast.toggled.connect(self.fast_bloom_cb.setChecked)
             self.fast_bloom_cb.toggled.connect(self.actFast.setChecked)
             self.scanline_slider.valueChanged.connect(self.on_scanline_slider)
@@ -693,6 +1441,8 @@ def launch_gui() -> None:
             self.scanline_val.valueChanged.connect(self.on_scanline_val)
             self.triad_val.valueChanged.connect(self.on_triad_val)
             self.reset_btn.clicked.connect(self.on_reset)
+            self.save_btn.clicked.connect(self.on_save_preset)
+            self.load_btn.clicked.connect(self.on_load_preset)
             self.clip = None
             self.timer = QtCore.QTimer(self)
             self.timer.timeout.connect(self.on_tick)
@@ -701,6 +1451,23 @@ def launch_gui() -> None:
             self.prev_img = None
             self.preview_max_w = 960
             self.preview_max_h = 540
+            self.hw_reader = None
+
+            # Capture defaults for Reset
+            self._defaults = self._collect_settings()
+
+            # Live refresh when text controls change
+            self.text_input.textChanged.connect(lambda _=None: self._render_current_frame())
+            self.text_font_combo.currentFontChanged.connect(lambda _=None: self._render_current_frame())
+            self.text_font_browse.clicked.connect(self.on_browse_font)
+            self.text_font_path.textChanged.connect(lambda _=None: self._render_current_frame())
+            self.text_size.valueChanged.connect(lambda _=None: self._render_current_frame())
+            self.text_color.textChanged.connect(lambda _=None: self._render_current_frame())
+            self.text_x.valueChanged.connect(lambda _=None: self._render_current_frame())
+            self.text_y.valueChanged.connect(lambda _=None: self._render_current_frame())
+            self.text_after.toggled.connect(lambda _=None: self._render_current_frame())
+            self.text_save_btn.clicked.connect(self.on_save_text_preset)
+            self.text_load_btn.clicked.connect(self.on_load_text_preset)
 
         def on_scanline_slider(self, v: int) -> None:
             self.scanline_val.setValue(float(v) / 100.0)
@@ -721,11 +1488,31 @@ def launch_gui() -> None:
             self.load_clip(Path(path))
 
         def load_clip(self, p: Path) -> None:
+            # Clean up any existing clip/hw reader
+            try:
+                self._stop_hw_reader()
+            except Exception:
+                pass
+            if self.clip is not None:
+                try:
+                    self.clip.close()
+                except Exception:
+                    try:
+                        if hasattr(self.clip, "reader") and self.clip.reader:
+                            self.clip.reader.close()
+                    except Exception:
+                        pass
+                    try:
+                        if getattr(self.clip, "audio", None) is not None and hasattr(self.clip.audio, "reader"):
+                            self.clip.audio.reader.close_proc()
+                    except Exception:
+                        pass
             self.prev_img = None
             self.clip = VideoFileClip(str(p))
             fps = max(1, int(self.clip.fps or 24))
             self.timer.setInterval(int(1000 / fps))
             self.t = 0.0
+            self._restart_hw_reader()
 
         def on_play_pause(self) -> None:
             if self.clip is None:
@@ -736,18 +1523,34 @@ def launch_gui() -> None:
             if self.playing:
                 if not self.timer.isActive():
                     self.timer.start()
+                if self.actHWDec.isChecked() and self.hw_reader is None:
+                    self._restart_hw_reader()
             else:
                 self.timer.stop()
 
         def on_tick(self) -> None:
             if self.clip is None:
                 return
-            frame = self.clip.get_frame(self.t)
+            frame = None
+            if self.actHWDec.isChecked() and self.hw_reader is not None:
+                frame = self.hw_reader.read_next()
+                if frame is None:
+                    # try restart (loop)
+                    self._restart_hw_reader()
+                    frame = self.hw_reader.read_next() if self.hw_reader else None
+            if frame is None:
+                frame = self.clip.get_frame(self.t)
             w, h = frame.shape[1], frame.shape[0]
-            scale = min(self.preview_max_w / max(1, w), self.preview_max_h / max(1, h), 1.0)
-            if scale < 1.0:
+            avail_w = max(1, self.video_label.width())
+            avail_h = max(1, self.video_label.height())
+            scale = min(avail_w / max(1, w), avail_h / max(1, h))
+            if scale != 1.0:
                 im = Image.fromarray(frame)
                 frame = np.asarray(im.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.BILINEAR))
+            # Compute scaled text overlay size/position so UI values represent output pixels
+            txt_scale = float(scale)
+            txt_size_px = max(1, int(self.text_size.value() * txt_scale))
+            txt_pos = (int(self.text_x.value() * txt_scale), int(self.text_y.value() * txt_scale))
             out, self.prev_img = apply_crt_effect(
                 frame=frame,
                 scanline_strength=float(self.scanline_val.value()),
@@ -755,6 +1558,7 @@ def launch_gui() -> None:
                 aberration_px=int(self.aberration.value()),
                 bloom_sigma=float(self.bloom_sigma.value()),
                 bloom_strength=float(self.bloom_strength.value()),
+                bloom_threshold=float(self.bloom_threshold.value()),
                 noise_strength=float(self.noise_val.value()),
                 vignette_mask=make_vignette(frame.shape[0], frame.shape[1], float(self.vignette_val.value())) if self.vignette_val.value() > 0.0 else None,
                 persistence=float(self.persistence_val.value()),
@@ -765,6 +1569,28 @@ def launch_gui() -> None:
                 pixel_size=int(self.pixel_size.value()),
                 glitch_amp_px=int(self.glitch_amp.value()),
                 glitch_height_frac=float(self.glitch_height.value()),
+                time_sec=self.t,
+                brightness=float(self.brightness.value()),
+                contrast=float(self.contrast.value()),
+                gamma=float(self.gamma.value()),
+                saturation=float(self.saturation.value()),
+                temperature=float(self.temperature.value()),
+                flicker_strength=float(self.flicker_strength.value()),
+                flicker_hz=float(self.flicker_hz.value()),
+                grain_size=int(self.grain_size.value()),
+                scanline_angle=float(self.scanline_angle.value()),
+                scanline_thickness=float(self.scanline_thickness.value()),
+                warp_strength=float(self.warp_strength.value()),
+                text_overlay_rgba=_make_text_overlay_rgba_qt(
+                    frame.shape[1],
+                    frame.shape[0],
+                    self.text_input.text(),
+                    self._effective_font_spec(),
+                    int(txt_size_px),
+                    self.text_color.text(),
+                    txt_pos,
+                ) if self.text_input.text() else None,
+                text_overlay_after=bool(self.text_after.isChecked()),
             )
             qimg = QtGui.QImage(out.data, out.shape[1], out.shape[0], out.strides[0], QtGui.QImage.Format_RGB888)
             pix = QtGui.QPixmap.fromImage(qimg)
@@ -780,6 +1606,20 @@ def launch_gui() -> None:
             super().resizeEvent(e)
             self.preview_max_w = max(1, self.preview_frame.width() - 24)
             self.preview_max_h = max(1, self.preview_frame.height() - 24)
+            # Force relayout of label pixmap (guard against null pixmap)
+            pm = self.video_label.pixmap()
+            if pm is not None and not pm.isNull():
+                self.video_label.setPixmap(
+                    pm.scaled(
+                        self.preview_max_w,
+                        self.preview_max_h,
+                        QtCore.Qt.KeepAspectRatio,
+                        QtCore.Qt.SmoothTransformation,
+                    )
+                )
+            # Adjust HW reader scale
+            if self.actHWDec.isChecked() and self.hw_reader is not None:
+                self._restart_hw_reader()
 
         def on_render(self) -> None:
             if self.clip is None:
@@ -816,42 +1656,378 @@ def launch_gui() -> None:
                         pixel_size=int(self.pixel_size.value()),
                         gpu=bool(self.gpu_cb.isChecked()) if opts["gpu"] is None else bool(opts["gpu"]),
                         nvenc_preset=str(self.nvenc_preset.text()),
-                         glitch_amp_px=int(self.glitch_amp.value()),
-                         glitch_height_frac=float(self.glitch_height.value()),
+                        glitch_amp_px=int(self.glitch_amp.value()),
+                        glitch_height_frac=float(self.glitch_height.value()),
+                        encoder_preference=self._encoder_pref_gui(),
+                        decoder_preference=self._decoder_pref_gui(),
+                        bloom_threshold=float(self.bloom_threshold.value()),
+                        brightness=float(self.brightness.value()),
+                        contrast=float(self.contrast.value()),
+                        gamma=float(self.gamma.value()),
+                        saturation=float(self.saturation.value()),
+                        temperature=float(self.temperature.value()),
+                        flicker_strength=float(self.flicker_strength.value()),
+                        flicker_hz=float(self.flicker_hz.value()),
+                        grain_size=int(self.grain_size.value()),
+                        scanline_angle=float(self.scanline_angle.value()),
+                        scanline_thickness=float(self.scanline_thickness.value()),
+                        warp_strength=float(self.warp_strength.value()),
+                        text=str(self.text_input.text()),
+                        text_font=str(self._effective_font_spec()),
+                        text_size=int(self.text_size.value()),
+                        text_color=str(self.text_color.text()),
+                        text_pos=(int(self.text_x.value()), int(self.text_y.value())),
+                        text_after=bool(self.text_after.isChecked()),
                         progress_cb=lambda f: QtCore.QMetaObject.invokeMethod(self.progress, "setValue", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(int, int(f * 100))),
                     )
                     QtCore.QMetaObject.invokeMethod(self.progress, "setValue", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(int, 100))
                     QtCore.QMetaObject.invokeMethod(self.progress, "setVisible", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(bool, False))
                     QtCore.QMetaObject.invokeMethod(self, "_show_done", QtCore.Qt.QueuedConnection)
-                    QtCore.QMetaObject.invokeMethod(self.status, "showMessage", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(str, "GPU NVENC used" if used_gpu else "CPU x264 used"))
+                    QtCore.QMetaObject.invokeMethod(self.status, "showMessage", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(str, "Hardware encoder used" if used_gpu else "CPU x264 used"))
                 finally:
                     QtCore.QMetaObject.invokeMethod(self, "setEnabled", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(bool, True))
             th = threading.Thread(target=run_render, daemon=True)
             th.start()
 
+        @QtCore.Slot()
         def _show_done(self) -> None:
             QtWidgets.QMessageBox.information(self, "Done", "Render complete")
 
+        def _render_current_frame(self) -> None:
+            if self.clip is None:
+                return
+            try:
+                frame = self.clip.get_frame(self.t)
+            except Exception:
+                return
+            w, h = frame.shape[1], frame.shape[0]
+            avail_w = max(1, self.video_label.width())
+            avail_h = max(1, self.video_label.height())
+            scale = min(avail_w / max(1, w), avail_h / max(1, h))
+            if scale != 1.0:
+                im = Image.fromarray(frame)
+                frame = np.asarray(im.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.BILINEAR))
+            out, _ = apply_crt_effect(
+                frame=frame,
+                scanline_strength=float(self.scanline_val.value()),
+                triad_mask=make_triad_mask(frame.shape[0], frame.shape[1], float(self.triad_val.value())) if self.triad_val.value() > 0.0 else None,
+                aberration_px=int(self.aberration.value()),
+                bloom_sigma=float(self.bloom_sigma.value()),
+                bloom_strength=float(self.bloom_strength.value()),
+                bloom_threshold=float(self.bloom_threshold.value()),
+                noise_strength=float(self.noise_val.value()),
+                vignette_mask=make_vignette(frame.shape[0], frame.shape[1], float(self.vignette_val.value())) if self.vignette_val.value() > 0.0 else None,
+                persistence=0.0,
+                state_prev=None,
+                scanline_period_px=float(self.scanline_period.value()),
+                scanline_phase_px=float(self.scanline_speed.value()) * self.t,
+                fast_bloom=bool(self.fast_bloom_cb.isChecked()),
+                pixel_size=int(self.pixel_size.value()),
+                glitch_amp_px=int(self.glitch_amp.value()),
+                glitch_height_frac=float(self.glitch_height.value()),
+                time_sec=self.t,
+                brightness=float(self.brightness.value()),
+                contrast=float(self.contrast.value()),
+                gamma=float(self.gamma.value()),
+                saturation=float(self.saturation.value()),
+                temperature=float(self.temperature.value()),
+                flicker_strength=float(self.flicker_strength.value()),
+                flicker_hz=float(self.flicker_hz.value()),
+                grain_size=int(self.grain_size.value()),
+                scanline_angle=float(self.scanline_angle.value()),
+                scanline_thickness=float(self.scanline_thickness.value()),
+                warp_strength=float(self.warp_strength.value()),
+                text_overlay_rgba=_make_text_overlay_rgba(
+                    frame.shape[1],
+                    frame.shape[0],
+                    self.text_input.text(),
+                    self.text_font_combo.currentFont().family(),
+                    int(self.text_size.value()),
+                    self.text_color.text(),
+                    (int(self.text_x.value()), int(self.text_y.value())),
+                ) if self.text_input.text() else None,
+                text_overlay_after=bool(self.text_after.isChecked()),
+            )
+            qimg = QtGui.QImage(out.data, out.shape[1], out.shape[0], out.strides[0], QtGui.QImage.Format_RGB888)
+            pix = QtGui.QPixmap.fromImage(qimg)
+            self.video_label.setPixmap(pix)
+
         def on_reset(self) -> None:
-            self.scanline_slider.setValue(60)
-            self.scanline_val.setValue(0.6)
-            self.triad_slider.setValue(35)
-            self.triad_val.setValue(0.35)
-            self.pixel_size.setValue(2)
-            self.aberration.setValue(1)
-            self.noise_val.setValue(1.5)
-            self.bloom_sigma.setValue(1.2)
-            self.bloom_strength.setValue(0.25)
-            self.vignette_val.setValue(0.25)
-            self.persistence_val.setValue(0.2)
-            self.scanline_speed.setValue(60.0)
-            self.scanline_period.setValue(2.0)
-            self.crf_val.setValue(18)
-            self.nvenc_preset.setText("p4")
-            self.fast_bloom_cb.setChecked(True)
-            self.gpu_cb.setChecked(False)
-            self.glitch_amp.setValue(0)
-            self.glitch_height.setValue(0.0)
+            if hasattr(self, "_defaults") and isinstance(self._defaults, dict):
+                self._apply_settings(self._defaults)
+            else:
+                # fallback minimal reset
+                self.scanline_slider.setValue(60)
+                self.triad_slider.setValue(35)
+                self.pixel_size.setValue(2)
+                self.aberration.setValue(1)
+                self.noise_val.setValue(1.5)
+                self.bloom_sigma.setValue(1.2)
+                self.bloom_strength.setValue(0.25)
+                self.vignette_val.setValue(0.25)
+                self.persistence_val.setValue(0.2)
+                self.scanline_speed.setValue(60.0)
+                self.scanline_period.setValue(2.0)
+                self.crf_val.setValue(18)
+                self.nvenc_preset.setText(self.nvenc_preset.text())
+                self.fast_bloom_cb.setChecked(True)
+                self.gpu_cb.setChecked(False)
+                self.glitch_amp.setValue(0)
+                self.glitch_height.setValue(0.0)
+
+        def _collect_settings(self) -> dict:
+            return {
+                "scanline": float(self.scanline_val.value()),
+                "triad": float(self.triad_val.value()),
+                "pixel_size": int(self.pixel_size.value()),
+                "aberration_px": int(self.aberration.value()),
+                "noise": float(self.noise_val.value()),
+                "bloom_sigma": float(self.bloom_sigma.value()),
+                "bloom_strength": float(self.bloom_strength.value()),
+                "bloom_threshold": float(self.bloom_threshold.value()),
+                "vignette": float(self.vignette_val.value()),
+                "persistence": float(self.persistence_val.value()),
+                "scanline_speed": float(self.scanline_speed.value()),
+                "scanline_period": float(self.scanline_period.value()),
+                "glitch_amp": int(self.glitch_amp.value()),
+                "glitch_height": float(self.glitch_height.value()),
+                "crf": int(self.crf_val.value()),
+                "nvenc_preset": str(self.nvenc_preset.text()),
+                "fast_bloom": bool(self.fast_bloom_cb.isChecked()),
+                "gpu": bool(self.gpu_cb.isChecked()),
+                "encoder": self._encoder_pref_gui(),
+                # Advanced
+                "brightness": float(self.brightness.value()),
+                "contrast": float(self.contrast.value()),
+                "gamma": float(self.gamma.value()),
+                "saturation": float(self.saturation.value()),
+                "temperature": float(self.temperature.value()),
+                "flicker_strength": float(self.flicker_strength.value()),
+                "flicker_hz": float(self.flicker_hz.value()),
+                "grain_size": int(self.grain_size.value()),
+                "scanline_angle": float(self.scanline_angle.value()),
+                "scanline_thickness": float(self.scanline_thickness.value()),
+                "warp_strength": float(self.warp_strength.value()),
+            }
+
+        def _set_encoder_pref_gui(self, pref: str) -> None:
+            mapping = ["auto", "nvidia", "amd", "cpu"]
+            try:
+                idx = mapping.index(str(pref).strip().lower())
+            except ValueError:
+                idx = 0
+            self.encoder_choice.setCurrentIndex(idx)
+
+        def _apply_settings(self, s: dict) -> None:
+            if not isinstance(s, dict):
+                return
+            if "scanline" in s:
+                self.scanline_val.setValue(float(s["scanline"]))
+            if "triad" in s:
+                self.triad_val.setValue(float(s["triad"]))
+            if "pixel_size" in s:
+                self.pixel_size.setValue(int(s["pixel_size"]))
+            if "aberration_px" in s:
+                self.aberration.setValue(int(s["aberration_px"]))
+            if "noise" in s:
+                self.noise_val.setValue(float(s["noise"]))
+            if "bloom_sigma" in s:
+                self.bloom_sigma.setValue(float(s["bloom_sigma"]))
+            if "bloom_strength" in s:
+                self.bloom_strength.setValue(float(s["bloom_strength"]))
+            if "bloom_threshold" in s:
+                self.bloom_threshold.setValue(float(s["bloom_threshold"]))
+            if "vignette" in s:
+                self.vignette_val.setValue(float(s["vignette"]))
+            if "persistence" in s:
+                self.persistence_val.setValue(float(s["persistence"]))
+            if "scanline_speed" in s:
+                self.scanline_speed.setValue(float(s["scanline_speed"]))
+            if "scanline_period" in s:
+                self.scanline_period.setValue(float(s["scanline_period"]))
+            if "glitch_amp" in s:
+                self.glitch_amp.setValue(int(s["glitch_amp"]))
+            if "glitch_height" in s:
+                self.glitch_height.setValue(float(s["glitch_height"]))
+            if "crf" in s:
+                self.crf_val.setValue(int(s["crf"]))
+            if "nvenc_preset" in s:
+                self.nvenc_preset.setText(str(s["nvenc_preset"]))
+            if "fast_bloom" in s:
+                self.fast_bloom_cb.setChecked(bool(s["fast_bloom"]))
+            if "gpu" in s:
+                self.gpu_cb.setChecked(bool(s["gpu"]))
+            if "encoder" in s:
+                self._set_encoder_pref_gui(str(s["encoder"]))
+            # Advanced
+            if "brightness" in s:
+                self.brightness.setValue(float(s["brightness"]))
+            if "contrast" in s:
+                self.contrast.setValue(float(s["contrast"]))
+            if "gamma" in s:
+                self.gamma.setValue(float(s["gamma"]))
+            if "saturation" in s:
+                self.saturation.setValue(float(s["saturation"]))
+            if "temperature" in s:
+                self.temperature.setValue(float(s["temperature"]))
+            if "flicker_strength" in s:
+                self.flicker_strength.setValue(float(s["flicker_strength"]))
+            if "flicker_hz" in s:
+                self.flicker_hz.setValue(float(s["flicker_hz"]))
+            if "grain_size" in s:
+                self.grain_size.setValue(int(s["grain_size"]))
+            if "scanline_angle" in s:
+                self.scanline_angle.setValue(float(s["scanline_angle"]))
+            if "scanline_thickness" in s:
+                self.scanline_thickness.setValue(float(s["scanline_thickness"]))
+            if "warp_strength" in s:
+                self.warp_strength.setValue(float(s["warp_strength"]))
+
+        def on_save_preset(self) -> None:
+            from PySide6 import QtWidgets
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Preset", str(Path.cwd() / "preset.json"), "JSON (*.json)")
+            if not path:
+                return
+            data = self._collect_settings()
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+                self.status.showMessage("Preset saved")
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "Error", f"Failed to save preset:\n{e}")
+
+        def on_load_preset(self) -> None:
+            from PySide6 import QtWidgets
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load Preset", str(Path.cwd()), "JSON (*.json)")
+            if not path:
+                return
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self._apply_settings(data)
+                self.status.showMessage("Preset loaded")
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "Error", f"Failed to load preset:\n{e}")
+
+        def _encoder_pref_gui(self) -> str:
+            idx = int(self.encoder_choice.currentIndex()) if hasattr(self, "encoder_choice") else 0
+            return ["auto", "nvidia", "amd", "cpu"][idx]
+
+        def _decoder_pref_gui(self) -> str:
+            idx = int(self.decoder_choice.currentIndex()) if hasattr(self, "decoder_choice") else 0
+            return ["auto", "nvidia", "amd", "intel", "cpu"][idx]
+
+        def _effective_font_spec(self) -> str:
+            path = self.text_font_path.text().strip()
+            if path:
+                return path
+            return self.text_font_combo.currentFont().family()
+
+        def on_browse_font(self) -> None:
+            from PySide6 import QtWidgets
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Choose Font", str(Path.cwd()), "Fonts (*.ttf *.otf)")
+            if path:
+                self.text_font_path.setText(path)
+
+        def on_save_text_preset(self) -> None:
+            from PySide6 import QtWidgets
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Text Preset", str(Path.cwd() / "text_preset.json"), "JSON (*.json)")
+            if not path:
+                return
+            data = {
+                "text": self.text_input.text(),
+                "font": self._effective_font_spec(),
+                "size": int(self.text_size.value()),
+                "color": self.text_color.text(),
+                "x": int(self.text_x.value()),
+                "y": int(self.text_y.value()),
+                "after": bool(self.text_after.isChecked()),
+            }
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+                self.status.showMessage("Text preset saved")
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "Error", f"Failed to save text preset:\n{e}")
+
+        def on_load_text_preset(self) -> None:
+            from PySide6 import QtWidgets
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load Text Preset", str(Path.cwd()), "JSON (*.json)")
+            if not path:
+                return
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self.text_input.setText(str(data.get("text", "")))
+                self.text_font_path.setText(str(data.get("font", "")))
+                self.text_size.setValue(int(data.get("size", 36)))
+                self.text_color.setText(str(data.get("color", "#FFFFFF")))
+                self.text_x.setValue(int(data.get("x", 32)))
+                self.text_y.setValue(int(data.get("y", 32)))
+                self.text_after.setChecked(bool(data.get("after", True)))
+                self.status.showMessage("Text preset loaded")
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "Error", f"Failed to load text preset:\n{e}")
+
+        def on_hwdec_toggle(self, enabled: bool) -> None:
+            if enabled:
+                self._restart_hw_reader()
+            else:
+                self._stop_hw_reader()
+
+        def closeEvent(self, e: QtGui.QCloseEvent) -> None:
+            try:
+                self.timer.stop()
+            except Exception:
+                pass
+            try:
+                self._stop_hw_reader()
+            except Exception:
+                pass
+            if self.clip is not None:
+                try:
+                    self.clip.close()
+                except Exception:
+                    try:
+                        if hasattr(self.clip, "reader") and self.clip.reader:
+                            self.clip.reader.close()
+                    except Exception:
+                        pass
+                    try:
+                        if getattr(self.clip, "audio", None) is not None and hasattr(self.clip.audio, "reader"):
+                            self.clip.audio.reader.close_proc()
+                    except Exception:
+                        pass
+            super().closeEvent(e)
+
+        def _stop_hw_reader(self) -> None:
+            r = getattr(self, "hw_reader", None)
+            if r is not None:
+                try:
+                    r.stop()
+                except Exception:
+                    pass
+            self.hw_reader = None
+
+        def _restart_hw_reader(self) -> None:
+            self._stop_hw_reader()
+            try:
+                if not self.clip or not self.actHWDec.isChecked():
+                    return
+                src_path = Path(self.clip.filename)
+                if not src_path.exists():
+                    return
+                w, h = self.clip.size
+                # scale to preview to reduce bandwidth
+                scale = min(self.preview_max_w / max(1, w), self.preview_max_h / max(1, h), 1.0)
+                sw = max(1, int(w * scale))
+                sh = max(1, int(h * scale))
+                fps = max(1, int(self.clip.fps or 24))
+                self.hw_reader = HWPreviewReader(src_path, sw, sh, fps)
+                self.hw_reader.start()
+            except Exception:
+                self.hw_reader = None
+
 
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle("Fusion")
