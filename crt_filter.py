@@ -1557,6 +1557,33 @@ def launch_gui() -> None:
             self.text_after.toggled.connect(lambda _=None: self._render_current_frame())
             self.text_save_btn.clicked.connect(self.on_save_text_preset)
             self.text_load_btn.clicked.connect(self.on_load_text_preset)
+            # Live refresh for effect controls when paused
+            self.scanline_val.valueChanged.connect(lambda _=None: self._render_current_frame())
+            self.triad_val.valueChanged.connect(lambda _=None: self._render_current_frame())
+            self.triad_gamma.valueChanged.connect(lambda _=None: self._render_current_frame())
+            self.triad_softness.valueChanged.connect(lambda _=None: self._render_current_frame())
+            self.triad_preserve_luma.toggled.connect(lambda _=None: self._render_current_frame())
+            self.pixel_size.valueChanged.connect(lambda _=None: self._render_current_frame())
+            self.aberration.valueChanged.connect(lambda _=None: self._render_current_frame())
+            self.noise_val.valueChanged.connect(lambda _=None: self._render_current_frame())
+            self.bloom_sigma.valueChanged.connect(lambda _=None: self._render_current_frame())
+            self.bloom_strength.valueChanged.connect(lambda _=None: self._render_current_frame())
+            self.vignette_val.valueChanged.connect(lambda _=None: self._render_current_frame())
+            self.persistence_val.valueChanged.connect(lambda _=None: self._render_current_frame())
+            self.scanline_speed.valueChanged.connect(lambda _=None: self._render_current_frame())
+            self.scanline_period.valueChanged.connect(lambda _=None: self._render_current_frame())
+            self.fast_bloom_cb.toggled.connect(lambda _=None: self._render_current_frame())
+            self.brightness.valueChanged.connect(lambda _=None: self._render_current_frame())
+            self.contrast.valueChanged.connect(lambda _=None: self._render_current_frame())
+            self.gamma.valueChanged.connect(lambda _=None: self._render_current_frame())
+            self.saturation.valueChanged.connect(lambda _=None: self._render_current_frame())
+            self.temperature.valueChanged.connect(lambda _=None: self._render_current_frame())
+            self.flicker_strength.valueChanged.connect(lambda _=None: self._render_current_frame())
+            self.flicker_hz.valueChanged.connect(lambda _=None: self._render_current_frame())
+            self.grain_size.valueChanged.connect(lambda _=None: self._render_current_frame())
+            self.scanline_angle.valueChanged.connect(lambda _=None: self._render_current_frame())
+            self.scanline_thickness.valueChanged.connect(lambda _=None: self._render_current_frame())
+            self.warp_strength.valueChanged.connect(lambda _=None: self._render_current_frame())
 
         def on_scanline_slider(self, v: int) -> None:
             self.scanline_val.setValue(float(v) / 100.0)
@@ -1602,6 +1629,7 @@ def launch_gui() -> None:
             self.timer.setInterval(int(1000 / fps))
             self.t = 0.0
             self._restart_hw_reader()
+            self._render_current_frame()
 
         def on_play_pause(self) -> None:
             if self.clip is None:
