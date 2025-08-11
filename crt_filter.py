@@ -10,6 +10,8 @@ from typing import Optional, Tuple, Callable
 from concurrent.futures import ThreadPoolExecutor, Future
 import numpy as np
 import threading
+import time
+from collections import defaultdict
 
 
 def ensure_deps() -> None:
@@ -51,6 +53,51 @@ from moviepy.video.io.ffmpeg_writer import FFMPEG_VideoWriter
 import imageio_ffmpeg as iio_ffmpeg
 from PIL import ImageDraw, ImageFont, ImageFont
 import subprocess as _sub
+
+
+_perf_lock = threading.Lock()
+_perf_totals = defaultdict(float)
+_perf_counts = defaultdict(int)
+
+
+def perf_add(name: str, dt: float) -> None:
+    with _perf_lock:
+        _perf_totals[name] += float(dt)
+        _perf_counts[name] = _perf_counts.get(name, 0) + 1
+
+
+def perf_report(total_frames: int, total_seconds: float) -> None:
+    items = sorted(_perf_totals.items(), key=lambda kv: kv[1], reverse=True)
+    print(f"perf total {total_seconds:.3f}s")
+    print(f"perf frames {total_frames}")
+    for k, v in items:
+        c = _perf_counts.get(k, 0)
+        avg = (v / c * 1000.0) if c else 0.0
+        print(f"{k} total={v:.3f}s count={c} avg_ms={avg:.2f}")
+
+
+def perf_timed_iter(iterable, name: str):
+    it = iter(iterable)
+    while True:
+        t0 = time.perf_counter()
+        try:
+            v = next(it)
+        except StopIteration:
+            return
+        perf_add(name, time.perf_counter() - t0)
+        yield v
+
+
+def perf_report_auto() -> None:
+    total_frames = _perf_counts.get("crt.total", 0) + _perf_counts.get("fx.total", 0)
+    total_seconds = _perf_totals.get("crt.total", 0.0) + _perf_totals.get("fx.total", 0.0)
+    perf_report(total_frames=total_frames, total_seconds=total_seconds)
+
+
+def perf_reset() -> None:
+    with _perf_lock:
+        _perf_totals.clear()
+        _perf_counts.clear()
 
 
 def normalize_nvenc_preset(preset: str) -> str:
@@ -190,20 +237,29 @@ def make_triad_mask(h: int, w: int, strength: float, softness_px: float = 0.0) -
 
 def _apply_triad_mask(img: np.ndarray, mask: np.ndarray, gamma: float = 2.2, preserve_luma: bool = True) -> np.ndarray:
     g = float(gamma)
+    if (not preserve_luma) and abs(g - 1.0) < 1e-3:
+        out = img * mask
+        return np.clip(out, 0.0, 1.0)
     if g <= 0.0:
         out = img * mask
         return np.clip(out, 0.0, 1.0)
-    lin = np.power(np.clip(img, 0.0, 1.0), g, dtype=np.float32)
+    lut_size = 1024
+    scale = float(lut_size)
+    lut_x = np.linspace(0.0, 1.0, lut_size + 1, dtype=np.float32)
+    lut_g = np.power(lut_x, g, dtype=np.float32)
+    idx = np.clip((np.clip(img, 0.0, 1.0) * scale).astype(np.int32), 0, lut_size)
+    lin = lut_g[idx]
     out_lin = lin * mask
     if preserve_luma:
         w_r, w_g, w_b = 0.2126, 0.7152, 0.0722
         y_before = w_r * lin[:, :, 0] + w_g * lin[:, :, 1] + w_b * lin[:, :, 2]
         y_after = w_r * out_lin[:, :, 0] + w_g * out_lin[:, :, 1] + w_b * out_lin[:, :, 2]
-        eps = 1e-6
-        ratio = y_before / np.maximum(y_after, eps)
+        ratio = y_before / np.maximum(y_after, 1e-6)
         ratio = np.clip(ratio, 0.5, 2.0)
         out_lin = out_lin * ratio[:, :, None]
-    out = np.power(np.clip(out_lin, 0.0, 1.0), 1.0 / g, dtype=np.float32)
+    lut_inv = np.power(lut_x, 1.0 / g, dtype=np.float32)
+    idx2 = np.clip((np.clip(out_lin, 0.0, 1.0) * scale).astype(np.int32), 0, lut_size)
+    out = lut_inv[idx2]
     return np.clip(out, 0.0, 1.0)
 
 
@@ -507,22 +563,30 @@ def apply_crt_effect(
     text_overlay_rgba: Optional[np.ndarray] = None,
     text_overlay_after: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
+    t_all = time.perf_counter()
     h, w = frame.shape[0], frame.shape[1]
+    t0 = time.perf_counter()
     img = frame.astype(np.float32) / 255.0
+    perf_add("crt.astype", time.perf_counter() - t0)
     if aberration_px != 0:
+        t0 = time.perf_counter()
         r = shift_channel(img[:, :, 0], aberration_px, 0)
         g = img[:, :, 1]
         b = shift_channel(img[:, :, 2], -aberration_px, 0)
         img = np.stack([r, g, b], axis=2)
+        perf_add("crt.aberration", time.perf_counter() - t0)
     if pixel_size > 1:
+        t0 = time.perf_counter()
         sw = max(1, w // int(pixel_size))
         sh = max(1, h // int(pixel_size))
         img = cv2.resize(img, (sw, sh), interpolation=cv2.INTER_NEAREST)
         img = cv2.resize(img, (w, h), interpolation=cv2.INTER_NEAREST)
-    # Color adjustments prior to bloom
+        perf_add("crt.pixelate", time.perf_counter() - t0)
+    t0 = time.perf_counter()
     img = apply_color_adjustments(img, brightness, contrast, gamma, saturation, temperature)
-    # Text overlay before effects
+    perf_add("crt.color", time.perf_counter() - t0)
     if text_overlay_rgba is not None and not text_overlay_after:
+        t0 = time.perf_counter()
         ov = text_overlay_rgba
         if ov.dtype != np.uint8:
             ov = np.clip(ov, 0, 255).astype(np.uint8)
@@ -531,7 +595,9 @@ def apply_crt_effect(
         alpha = (ov[:, :, 3:4].astype(np.float32)) / 255.0
         rgb = ov[:, :, :3].astype(np.float32) / 255.0
         img = np.clip(img * (1.0 - alpha) + rgb * alpha, 0.0, 1.0)
+        perf_add("crt.text_before", time.perf_counter() - t0)
     if bloom_strength > 0.0 and (bloom_sigma > 0.0 or fast_bloom):
+        t0 = time.perf_counter()
         src = img
         if bloom_threshold > 0.0:
             thr = float(min(0.99, max(0.0, bloom_threshold)))
@@ -543,37 +609,49 @@ def apply_crt_effect(
             k = max(1, int(round(bloom_sigma * 3)) * 2 + 1)
             blurf = cv2.GaussianBlur(src, (k, k), sigmaX=bloom_sigma, sigmaY=bloom_sigma, borderType=cv2.BORDER_REPLICATE)
         img = np.clip(img + bloom_strength * blurf, 0.0, 1.0)
+        perf_add("crt.bloom", time.perf_counter() - t0)
     if triad_mask is not None:
+        t0 = time.perf_counter()
         img = _apply_triad_mask(img, triad_mask, triad_gamma, triad_preserve_luma)
+        perf_add("crt.triad", time.perf_counter() - t0)
     if scanline_strength > 0.0:
+        t0 = time.perf_counter()
         if scanline_angle == 0.0 and scanline_thickness == 1.0:
             sl = make_scanline_mask_dynamic(h, scanline_strength, scanline_period_px, scanline_phase_px)
             img = np.clip(img * sl[:, None, None], 0.0, 1.0)
         else:
             sl2d = make_scanline_mask_2d(h, w, scanline_strength, scanline_period_px, scanline_phase_px, scanline_angle, scanline_thickness)
             img = np.clip(img * sl2d[:, :, None], 0.0, 1.0)
+        perf_add("crt.scanlines", time.perf_counter() - t0)
     if vignette_mask is not None:
+        t0 = time.perf_counter()
         img = np.clip(img * vignette_mask[:, :, None], 0.0, 1.0)
-    # Flicker modulation
+        perf_add("crt.vignette", time.perf_counter() - t0)
     if flicker_strength > 0.0 and flicker_hz > 0.0:
+        t0 = time.perf_counter()
         factor = 1.0 + 0.25 * float(flicker_strength) * np.sin(2.0 * np.pi * float(flicker_hz) * float(time_sec))
         img = np.clip(img * factor, 0.0, 1.0)
-    # Grain/noise
+        perf_add("crt.flicker", time.perf_counter() - t0)
     if noise_strength > 0.0:
+        t0 = time.perf_counter()
         if grain_size and grain_size > 1:
             gh = max(1, h // int(grain_size))
             gw = max(1, w // int(grain_size))
-            small_noise = np.random.standard_normal(size=(gh, gw)).astype(np.float32)
+            small_noise = np.empty((gh, gw), dtype=np.float32)
+            cv2.randn(small_noise, 0.0, 1.0)
             noise = cv2.resize(small_noise, (w, h), interpolation=cv2.INTER_LINEAR)
         else:
-            noise = np.random.standard_normal(size=img.shape[:2]).astype(np.float32)
+            noise = np.empty((h, w), dtype=np.float32)
+            cv2.randn(noise, 0.0, 1.0)
         noise = noise * (noise_strength / 255.0)
         img = np.clip(img + noise[:, :, None], 0.0, 1.0)
-    # Warp at end for better edges
+        perf_add("crt.noise", time.perf_counter() - t0)
     if warp_strength != 0.0:
+        t0 = time.perf_counter()
         img = apply_barrel_warp(img, warp_strength)
-    # Text overlay after effects
+        perf_add("crt.warp", time.perf_counter() - t0)
     if text_overlay_rgba is not None and text_overlay_after:
+        t0 = time.perf_counter()
         ov = text_overlay_rgba
         if ov.dtype != np.uint8:
             ov = np.clip(ov, 0, 255).astype(np.uint8)
@@ -582,7 +660,9 @@ def apply_crt_effect(
         alpha = (ov[:, :, 3:4].astype(np.float32)) / 255.0
         rgb = ov[:, :, :3].astype(np.float32) / 255.0
         img = np.clip(img * (1.0 - alpha) + rgb * alpha, 0.0, 1.0)
+        perf_add("crt.text_after", time.perf_counter() - t0)
     if glitch_amp_px > 0 and glitch_height_frac > 0.0:
+        t0 = time.perf_counter()
         h2, w2 = img.shape[0], img.shape[1]
         y0 = max(0, min(h2, h2 - int(h2 * glitch_height_frac)))
         if y0 < h2:
@@ -603,15 +683,19 @@ def apply_crt_effect(
             idx = np.broadcast_to(xi[:, :, None], bottom.shape)
             bottom = np.take_along_axis(bottom, idx, axis=1)
             img[y0:, :, :] = bottom
+        perf_add("crt.glitch", time.perf_counter() - t0)
     if state_prev is not None and persistence > 0.0:
+        t0 = time.perf_counter()
         if state_prev.shape != img.shape:
-            prev_im = Image.fromarray(np.clip(state_prev * 255.0, 0, 255).astype(np.uint8))
-            prev_im = prev_im.resize((w, h), Image.BILINEAR)
-            prev_arr = np.asarray(prev_im).astype(np.float32) / 255.0
+            prev_arr = cv2.resize(state_prev, (w, h), interpolation=cv2.INTER_LINEAR)
         else:
             prev_arr = state_prev
-        img = np.clip(persistence * prev_arr + (1.0 - persistence) * img, 0.0, 1.0)
-    out = np.clip(img * 255.0, 0, 255).astype(np.uint8)
+        img = cv2.addWeighted(prev_arr, float(persistence), img, float(1.0 - persistence), 0.0)
+        perf_add("crt.persistence", time.perf_counter() - t0)
+    t0 = time.perf_counter()
+    out = cv2.convertScaleAbs(img, alpha=255.0, beta=0)
+    perf_add("crt.to_uint8", time.perf_counter() - t0)
+    perf_add("crt.total", time.perf_counter() - t_all)
     return out, img
 
 
@@ -648,21 +732,31 @@ def apply_static_effects(
     text_overlay_rgba: Optional[np.ndarray] = None,
     text_overlay_after: bool = True,
 ) -> np.ndarray:
+    t_all = time.perf_counter()
     h, w = frame.shape[0], frame.shape[1]
+    t0 = time.perf_counter()
     img = frame.astype(np.float32) / 255.0
+    perf_add("fx.astype", time.perf_counter() - t0)
     if aberration_px != 0:
+        t0 = time.perf_counter()
         r = shift_channel(img[:, :, 0], aberration_px, 0)
         g = img[:, :, 1]
         b = shift_channel(img[:, :, 2], -aberration_px, 0)
         img = np.stack([r, g, b], axis=2)
+        perf_add("fx.aberration", time.perf_counter() - t0)
     if pixel_size > 1:
+        t0 = time.perf_counter()
         sw = max(1, w // int(pixel_size))
         sh = max(1, h // int(pixel_size))
         img = cv2.resize(img, (sw, sh), interpolation=cv2.INTER_NEAREST)
         img = cv2.resize(img, (w, h), interpolation=cv2.INTER_NEAREST)
+        perf_add("fx.pixelate", time.perf_counter() - t0)
+    t0 = time.perf_counter()
     img = apply_color_adjustments(img, brightness, contrast, gamma, saturation, temperature)
+    perf_add("fx.color", time.perf_counter() - t0)
     # Text overlay before effects
     if text_overlay_rgba is not None and not text_overlay_after:
+        t0 = time.perf_counter()
         ov = text_overlay_rgba
         if ov.dtype != np.uint8:
             ov = np.clip(ov, 0, 255).astype(np.uint8)
@@ -671,7 +765,9 @@ def apply_static_effects(
         alpha = (ov[:, :, 3:4].astype(np.float32)) / 255.0
         rgb = ov[:, :, :3].astype(np.float32) / 255.0
         img = np.clip(img * (1.0 - alpha) + rgb * alpha, 0.0, 1.0)
+        perf_add("fx.text_before", time.perf_counter() - t0)
     if bloom_strength > 0.0 and (bloom_sigma > 0.0 or fast_bloom):
+        t0 = time.perf_counter()
         src = img
         if bloom_threshold > 0.0:
             thr = float(min(0.99, max(0.0, bloom_threshold)))
@@ -683,34 +779,50 @@ def apply_static_effects(
             k = max(1, int(round(bloom_sigma * 3)) * 2 + 1)
             blurf = cv2.GaussianBlur(src, (k, k), sigmaX=bloom_sigma, sigmaY=bloom_sigma, borderType=cv2.BORDER_REPLICATE)
         img = np.clip(img + bloom_strength * blurf, 0.0, 1.0)
+        perf_add("fx.bloom", time.perf_counter() - t0)
     if triad_mask is not None:
+        t0 = time.perf_counter()
         img = _apply_triad_mask(img, triad_mask, triad_gamma, triad_preserve_luma)
+        perf_add("fx.triad", time.perf_counter() - t0)
     if scanline_strength > 0.0:
+        t0 = time.perf_counter()
         if scanline_angle == 0.0 and scanline_thickness == 1.0:
             sl = make_scanline_mask_dynamic(h, scanline_strength, scanline_period_px, scanline_phase_px)
             img = np.clip(img * sl[:, None, None], 0.0, 1.0)
         else:
             sl2d = make_scanline_mask_2d(h, w, scanline_strength, scanline_period_px, scanline_phase_px, scanline_angle, scanline_thickness)
             img = np.clip(img * sl2d[:, :, None], 0.0, 1.0)
+        perf_add("fx.scanlines", time.perf_counter() - t0)
     if vignette_mask is not None:
+        t0 = time.perf_counter()
         img = np.clip(img * vignette_mask[:, :, None], 0.0, 1.0)
+        perf_add("fx.vignette", time.perf_counter() - t0)
     if flicker_strength > 0.0 and flicker_hz > 0.0:
+        t0 = time.perf_counter()
         factor = 1.0 + 0.25 * float(flicker_strength) * np.sin(2.0 * np.pi * float(flicker_hz) * float(time_sec))
         img = np.clip(img * factor, 0.0, 1.0)
+        perf_add("fx.flicker", time.perf_counter() - t0)
     if noise_strength > 0.0:
+        t0 = time.perf_counter()
         if grain_size and grain_size > 1:
             gh = max(1, h // int(grain_size))
             gw = max(1, w // int(grain_size))
-            small_noise = np.random.standard_normal(size=(gh, gw)).astype(np.float32)
+            small_noise = np.empty((gh, gw), dtype=np.float32)
+            cv2.randn(small_noise, 0.0, 1.0)
             noise = cv2.resize(small_noise, (w, h), interpolation=cv2.INTER_LINEAR)
         else:
-            noise = np.random.standard_normal(size=img.shape[:2]).astype(np.float32)
+            noise = np.empty((h, w), dtype=np.float32)
+            cv2.randn(noise, 0.0, 1.0)
         noise = noise * (noise_strength / 255.0)
         img = np.clip(img + noise[:, :, None], 0.0, 1.0)
+        perf_add("fx.noise", time.perf_counter() - t0)
     if warp_strength != 0.0:
+        t0 = time.perf_counter()
         img = apply_barrel_warp(img, warp_strength)
+        perf_add("fx.warp", time.perf_counter() - t0)
     # Text overlay after effects
     if text_overlay_rgba is not None and text_overlay_after:
+        t0 = time.perf_counter()
         ov = text_overlay_rgba
         if ov.dtype != np.uint8:
             ov = np.clip(ov, 0, 255).astype(np.uint8)
@@ -719,7 +831,9 @@ def apply_static_effects(
         alpha = (ov[:, :, 3:4].astype(np.float32)) / 255.0
         rgb = ov[:, :, :3].astype(np.float32) / 255.0
         img = np.clip(img * (1.0 - alpha) + rgb * alpha, 0.0, 1.0)
+        perf_add("fx.text_after", time.perf_counter() - t0)
     if glitch_amp_px > 0 and glitch_height_frac > 0.0:
+        t0 = time.perf_counter()
         h2, w2 = img.shape[0], img.shape[1]
         y0 = max(0, min(h2, h2 - int(h2 * glitch_height_frac)))
         if y0 < h2:
@@ -742,6 +856,8 @@ def apply_static_effects(
             idx = np.broadcast_to(xi[:, :, None], bottom.shape)
             bottom = np.take_along_axis(bottom, idx, axis=1)
             img[y0:, :, :] = bottom
+        perf_add("fx.glitch", time.perf_counter() - t0)
+    perf_add("fx.total", time.perf_counter() - t_all)
     return img
 
 
@@ -805,6 +921,7 @@ def process_video(
     try:
         import math, tempfile
         total_frames = max(1, int(math.ceil((clip.duration or 0) * fps_out)))
+        t_pipeline_start = time.perf_counter()
         audio_path: Optional[str] = None
         if clip.audio is not None:
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".aac")
@@ -895,8 +1012,8 @@ def process_video(
         if not used_gpu:
             writer_kwargs["preset"] = "medium"
         writer = FFMPEG_VideoWriter(**writer_kwargs)
-        max_workers = max((os.cpu_count() or 4) - 1, 1)
-        queue_cap = max_workers * 6
+        max_workers = max(1, min(2, (os.cpu_count() or 4) // 2))
+        queue_cap = max_workers * 4
         executor = ThreadPoolExecutor(max_workers=max_workers)
         futures = {}
         next_write = 0
@@ -914,13 +1031,15 @@ def process_video(
                 return None
         hw_reader = _open_hw_reader()
         if hw_reader is not None:
-            frame_iter = hw_reader.iter_frames()
+            frame_iter = perf_timed_iter(hw_reader.iter_frames(), "io.hw_decode")
         else:
-            frame_iter = clip.iter_frames(fps=fps_out, dtype="uint8")
+            frame_iter = perf_timed_iter(clip.iter_frames(fps=fps_out, dtype="uint8"), "io.decode")
         for frame in frame_iter:
+            t_submit = time.perf_counter()
             if frame.shape[1] != out_w or frame.shape[0] != out_h:
                 im = Image.fromarray(frame)
                 frame = np.asarray(im.resize((out_w, out_h), Image.BILINEAR))
+            perf_add("io.resize_in", time.perf_counter() - t_submit)
             phase = (i / float(fps_out)) * scanline_speed_px_s
             def submit_job(idx: int, f: np.ndarray, ph: float):
                 return executor.submit(
@@ -961,40 +1080,58 @@ def process_video(
             i += 1
             while len(futures) >= queue_cap or next_write in futures:
                 if next_write in futures:
+                    t0 = time.perf_counter()
                     static_img = futures.pop(next_write).result()
+                    perf_add("fx.future_wait", time.perf_counter() - t0)
                     if prev_state is not None and persistence > 0.0:
+                        t0 = time.perf_counter()
                         if prev_state.shape != static_img.shape:
                             prev_im = Image.fromarray(np.clip(prev_state * 255.0, 0, 255).astype(np.uint8))
                             prev_im = prev_im.resize((out_w, out_h), Image.BILINEAR)
                             prev_state = np.asarray(prev_im).astype(np.float32) / 255.0
                         blended = np.clip(persistence * prev_state + (1.0 - persistence) * static_img, 0.0, 1.0)
+                        perf_add("fx.persistence_blend", time.perf_counter() - t0)
                     else:
                         blended = static_img
                     prev_state = blended
-                    out_frame = np.clip(blended * 255.0, 0, 255).astype(np.uint8)
+                    t0 = time.perf_counter()
+                    out_frame = cv2.convertScaleAbs(blended, alpha=255.0, beta=0)
+                    perf_add("io.to_uint8_out", time.perf_counter() - t0)
+                    t0 = time.perf_counter()
                     writer.write_frame(out_frame)
+                    perf_add("io.encode", time.perf_counter() - t0)
                     next_write += 1
                     if progress_cb is not None:
                         progress_cb(min(1.0, next_write / float(total_frames)))
                 else:
                     break
         while next_write in futures:
+            t0 = time.perf_counter()
             static_img = futures.pop(next_write).result()
+            perf_add("fx.future_wait", time.perf_counter() - t0)
             if prev_state is not None and persistence > 0.0:
+                t0 = time.perf_counter()
                 if prev_state.shape != static_img.shape:
                     prev_im = Image.fromarray(np.clip(prev_state * 255.0, 0, 255).astype(np.uint8))
                     prev_im = prev_im.resize((out_w, out_h), Image.BILINEAR)
                     prev_state = np.asarray(prev_im).astype(np.float32) / 255.0
                 blended = np.clip(persistence * prev_state + (1.0 - persistence) * static_img, 0.0, 1.0)
+                perf_add("fx.persistence_blend", time.perf_counter() - t0)
             else:
                 blended = static_img
             prev_state = blended
-            out_frame = np.clip(blended * 255.0, 0, 255).astype(np.uint8)
+            t0 = time.perf_counter()
+            out_frame = cv2.convertScaleAbs(blended, alpha=255.0, beta=0)
+            perf_add("io.to_uint8_out", time.perf_counter() - t0)
+            t0 = time.perf_counter()
             writer.write_frame(out_frame)
+            perf_add("io.encode", time.perf_counter() - t0)
             next_write += 1
             if progress_cb is not None:
                 progress_cb(min(1.0, next_write / float(total_frames)))
         writer.close()
+        total_seconds = time.perf_counter() - t_pipeline_start
+        perf_report(total_frames=total_frames, total_seconds=total_seconds)
         if hw_reader is not None:
             try:
                 hw_reader.close()
@@ -1075,6 +1212,7 @@ def main() -> None:
     if a.gui or not a.input:
         launch_gui()
         return
+    t_main = time.perf_counter()
     inp = Path(a.input)
     if not inp.exists():
         raise SystemExit("input not found")
@@ -1128,6 +1266,7 @@ def main() -> None:
         text_after=bool(a.text_after),
     )
     print("Hardware encoder used" if used_gpu else "CPU x264 used")
+    print(f"elapsed {time.perf_counter() - t_main:.3f}s")
 
 
 def launch_gui() -> None:
