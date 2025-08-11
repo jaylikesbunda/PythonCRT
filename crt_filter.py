@@ -733,6 +733,7 @@ def process_video(
     persistence: float,
     fps: Optional[int],
     crf: int,
+    target_bitrate_kbps: int,
     scanline_speed_px_s: float,
     scanline_period_px: float,
     fast_bloom: bool,
@@ -804,15 +805,54 @@ def process_video(
             else:
                 codec = "libx264"
         used_gpu = codec in ("h264_nvenc", "h264_amf")
-        # Build ffmpeg params per codec
+        kbps = int(max(0, target_bitrate_kbps or 0))
         if codec == "h264_nvenc":
             nv_preset = normalize_nvenc_preset(nvenc_preset)
-            ffparams = ["-cq", str(crf), "-preset", nv_preset, "-pix_fmt", "yuv420p"]
+            if kbps > 0:
+                ffparams = [
+                    "-b:v",
+                    f"{kbps}k",
+                    "-maxrate",
+                    f"{kbps}k",
+                    "-bufsize",
+                    f"{kbps * 2}k",
+                    "-rc",
+                    "vbr",
+                    "-preset",
+                    nv_preset,
+                    "-pix_fmt",
+                    "yuv420p",
+                ]
+            else:
+                ffparams = ["-cq", str(crf), "-preset", nv_preset, "-pix_fmt", "yuv420p"]
         elif codec == "h264_amf":
-            # Keep minimal flags for broad compatibility
-            ffparams = ["-pix_fmt", "yuv420p"]
+            if kbps > 0:
+                ffparams = [
+                    "-b:v",
+                    f"{kbps}k",
+                    "-maxrate",
+                    f"{kbps}k",
+                    "-bufsize",
+                    f"{kbps * 2}k",
+                    "-pix_fmt",
+                    "yuv420p",
+                ]
+            else:
+                ffparams = ["-pix_fmt", "yuv420p"]
         else:
-            ffparams = ["-crf", str(crf), "-pix_fmt", "yuv420p"]
+            if kbps > 0:
+                ffparams = [
+                    "-b:v",
+                    f"{kbps}k",
+                    "-maxrate",
+                    f"{kbps}k",
+                    "-bufsize",
+                    f"{kbps * 2}k",
+                    "-pix_fmt",
+                    "yuv420p",
+                ]
+            else:
+                ffparams = ["-crf", str(crf), "-pix_fmt", "yuv420p"]
         writer_kwargs = dict(
             filename=str(output_path),
             size=(out_w, out_h),
@@ -958,6 +998,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--vignette-strength", type=float, default=0.25)
     p.add_argument("--persistence", type=float, default=0.2)
     p.add_argument("--crf", type=int, default=18)
+    p.add_argument("--bitrate", type=int, default=0)
     p.add_argument("--scanline-speed", type=float, default=30.0)
     p.add_argument("--scanline-period", type=float, default=2.0)
     p.add_argument("--fast-bloom", action="store_true")
@@ -1018,6 +1059,7 @@ def main() -> None:
         persistence=float(max(0.0, min(0.95, a.persistence))),
         fps=a.fps if a.fps > 0 else None,
         crf=int(max(12, min(28, a.crf))),
+        target_bitrate_kbps=int(max(0, getattr(a, "bitrate", 0))),
         scanline_speed_px_s=float(a.scanline_speed),
         scanline_period_px=max(1.0, float(a.scanline_period)),
         fast_bloom=bool(a.fast_bloom),
@@ -1312,6 +1354,8 @@ def launch_gui() -> None:
             output_form.addRow("decoder", self.decoder_choice)
             output_form.addRow("fast bloom", self.fast_bloom_cb)
             output_form.addRow("crf/cq", self.crf_val)
+            self.bitrate_kbps = QtWidgets.QSpinBox(); self.bitrate_kbps.setRange(0, 200000); self.bitrate_kbps.setSingleStep(100); self.bitrate_kbps.setValue(0)
+            output_form.addRow("bitrate kbps (0 auto)", self.bitrate_kbps)
             output_form.addRow("nvenc preset", self.nvenc_preset)
             self.render_btn = QtWidgets.QPushButton("Render")
             self.reset_btn = QtWidgets.QPushButton("Reset")
@@ -1650,6 +1694,7 @@ def launch_gui() -> None:
                         persistence=float(self.persistence_val.value()),
                         fps=opts["fps"],
                         crf=int(self.crf_val.value()),
+                        target_bitrate_kbps=int(self.bitrate_kbps.value()),
                         scanline_speed_px_s=float(self.scanline_speed.value()),
                         scanline_period_px=float(self.scanline_period.value()),
                         fast_bloom=bool(self.fast_bloom_cb.isChecked()),
@@ -1772,6 +1817,7 @@ def launch_gui() -> None:
                 self.nvenc_preset.setText(self.nvenc_preset.text())
                 self.fast_bloom_cb.setChecked(True)
                 self.gpu_cb.setChecked(False)
+                self.bitrate_kbps.setValue(0)
                 self.glitch_amp.setValue(0)
                 self.glitch_height.setValue(0.0)
 
@@ -1792,6 +1838,7 @@ def launch_gui() -> None:
                 "glitch_amp": int(self.glitch_amp.value()),
                 "glitch_height": float(self.glitch_height.value()),
                 "crf": int(self.crf_val.value()),
+                "bitrate_kbps": int(self.bitrate_kbps.value()),
                 "nvenc_preset": str(self.nvenc_preset.text()),
                 "fast_bloom": bool(self.fast_bloom_cb.isChecked()),
                 "gpu": bool(self.gpu_cb.isChecked()),
@@ -1851,6 +1898,8 @@ def launch_gui() -> None:
                 self.glitch_height.setValue(float(s["glitch_height"]))
             if "crf" in s:
                 self.crf_val.setValue(int(s["crf"]))
+            if "bitrate_kbps" in s:
+                self.bitrate_kbps.setValue(int(s["bitrate_kbps"]))
             if "nvenc_preset" in s:
                 self.nvenc_preset.setText(str(s["nvenc_preset"]))
             if "fast_bloom" in s:
