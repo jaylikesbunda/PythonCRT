@@ -170,18 +170,41 @@ def make_scanline_mask_dynamic(h: int, strength: float, period_px: float, phase_
     return line
 
 
-def make_triad_mask(h: int, w: int, strength: float) -> np.ndarray:
+def make_triad_mask(h: int, w: int, strength: float, softness_px: float = 0.0) -> np.ndarray:
     x = np.arange(w)[None, :]
     m0 = (x % 3 == 0).astype(np.float32)
     m1 = (x % 3 == 1).astype(np.float32)
     m2 = (x % 3 == 2).astype(np.float32)
-    base = 1.0 - strength
-    r = base + strength * m0
-    g = base + strength * m1
-    b = base + strength * m2
-    mask = np.stack([r, g, b], axis=2)
+    base = 1.0 - float(strength)
+    r = base + float(strength) * m0
+    g = base + float(strength) * m1
+    b = base + float(strength) * m2
+    mask = np.stack([r, g, b], axis=2).astype(np.float32)
     mask = np.repeat(mask, h, axis=0)
-    return mask
+    s = float(max(0.0, softness_px))
+    if s > 0.0:
+        k = max(3, int(round(s * 3)) * 2 + 1)
+        mask = cv2.GaussianBlur(mask, (k, 1), sigmaX=s, sigmaY=0, borderType=cv2.BORDER_REPLICATE)
+    return mask.astype(np.float32)
+
+
+def _apply_triad_mask(img: np.ndarray, mask: np.ndarray, gamma: float = 2.2, preserve_luma: bool = True) -> np.ndarray:
+    g = float(gamma)
+    if g <= 0.0:
+        out = img * mask
+        return np.clip(out, 0.0, 1.0)
+    lin = np.power(np.clip(img, 0.0, 1.0), g, dtype=np.float32)
+    out_lin = lin * mask
+    if preserve_luma:
+        w_r, w_g, w_b = 0.2126, 0.7152, 0.0722
+        y_before = w_r * lin[:, :, 0] + w_g * lin[:, :, 1] + w_b * lin[:, :, 2]
+        y_after = w_r * out_lin[:, :, 0] + w_g * out_lin[:, :, 1] + w_b * out_lin[:, :, 2]
+        eps = 1e-6
+        ratio = y_before / np.maximum(y_after, eps)
+        ratio = np.clip(ratio, 0.5, 2.0)
+        out_lin = out_lin * ratio[:, :, None]
+    out = np.power(np.clip(out_lin, 0.0, 1.0), 1.0 / g, dtype=np.float32)
+    return np.clip(out, 0.0, 1.0)
 
 
 def make_vignette(h: int, w: int, strength: float) -> np.ndarray:
@@ -453,6 +476,8 @@ def apply_crt_effect(
     frame: np.ndarray,
     scanline_strength: float,
     triad_mask: Optional[np.ndarray],
+    triad_gamma: float,
+    triad_preserve_luma: bool,
     aberration_px: int,
     bloom_sigma: float,
     bloom_strength: float,
@@ -519,7 +544,7 @@ def apply_crt_effect(
             blurf = cv2.GaussianBlur(src, (k, k), sigmaX=bloom_sigma, sigmaY=bloom_sigma, borderType=cv2.BORDER_REPLICATE)
         img = np.clip(img + bloom_strength * blurf, 0.0, 1.0)
     if triad_mask is not None:
-        img = np.clip(img * triad_mask, 0.0, 1.0)
+        img = _apply_triad_mask(img, triad_mask, triad_gamma, triad_preserve_luma)
     if scanline_strength > 0.0:
         if scanline_angle == 0.0 and scanline_thickness == 1.0:
             sl = make_scanline_mask_dynamic(h, scanline_strength, scanline_period_px, scanline_phase_px)
@@ -594,6 +619,8 @@ def apply_static_effects(
     frame: np.ndarray,
     scanline_strength: float,
     triad_mask: Optional[np.ndarray],
+    triad_gamma: float,
+    triad_preserve_luma: bool,
     aberration_px: int,
     bloom_sigma: float,
     bloom_strength: float,
@@ -657,7 +684,7 @@ def apply_static_effects(
             blurf = cv2.GaussianBlur(src, (k, k), sigmaX=bloom_sigma, sigmaY=bloom_sigma, borderType=cv2.BORDER_REPLICATE)
         img = np.clip(img + bloom_strength * blurf, 0.0, 1.0)
     if triad_mask is not None:
-        img = np.clip(img * triad_mask, 0.0, 1.0)
+        img = _apply_triad_mask(img, triad_mask, triad_gamma, triad_preserve_luma)
     if scanline_strength > 0.0:
         if scanline_angle == 0.0 and scanline_thickness == 1.0:
             sl = make_scanline_mask_dynamic(h, scanline_strength, scanline_period_px, scanline_phase_px)
@@ -725,6 +752,9 @@ def process_video(
     height: Optional[int],
     scanline_strength: float,
     triad_strength: float,
+    triad_gamma: float,
+    triad_preserve_luma: bool,
+    triad_softness: float,
     aberration_px: int,
     bloom_sigma: float,
     bloom_strength: float,
@@ -770,7 +800,7 @@ def process_video(
         out_w, out_h = int(width), int(height)
     else:
         out_w, out_h = clip.size
-    triad_mask = make_triad_mask(out_h, out_w, triad_strength) if triad_strength > 0.0 else None
+    triad_mask = make_triad_mask(out_h, out_w, triad_strength, triad_softness) if triad_strength > 0.0 else None
     vignette_mask = make_vignette(out_h, out_w, vignette_strength) if vignette_strength > 0.0 else None
     try:
         import math, tempfile
@@ -898,6 +928,8 @@ def process_video(
                     f,
                     scanline_strength,
                     triad_mask,
+                    float(triad_gamma),
+                    bool(triad_preserve_luma),
                     aberration_px,
                     bloom_sigma,
                     bloom_strength,
@@ -990,6 +1022,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fps", type=int, default=0)
     p.add_argument("--scanline-strength", type=float, default=0.6)
     p.add_argument("--triad-strength", type=float, default=0.35)
+    p.add_argument("--triad-gamma", type=float, default=2.2)
+    p.add_argument("--triad-preserve-luma", action="store_true")
+    p.add_argument("--triad-softness", type=float, default=0.5)
     p.add_argument("--aberration-px", type=int, default=1)
     p.add_argument("--bloom-sigma", type=float, default=1.2)
     p.add_argument("--bloom-strength", type=float, default=0.25)
@@ -1051,6 +1086,9 @@ def main() -> None:
         height=a.height if a.height > 0 else None,
         scanline_strength=float(max(0.0, min(1.0, a.scanline_strength))),
         triad_strength=float(max(0.0, min(1.0, a.triad_strength))),
+        triad_gamma=float(max(0.1, a.triad_gamma)),
+        triad_preserve_luma=bool(a.triad_preserve_luma),
+        triad_softness=float(max(0.0, a.triad_softness)),
         aberration_px=int(max(-8, min(8, a.aberration_px))),
         bloom_sigma=max(0.0, a.bloom_sigma),
         bloom_strength=max(0.0, a.bloom_strength),
@@ -1280,6 +1318,10 @@ def launch_gui() -> None:
             self.triad_val.setRange(0.0, 1.0)
             self.triad_val.setSingleStep(0.01)
             self.triad_val.setValue(0.35)
+            self.triad_gamma = QtWidgets.QDoubleSpinBox(); self.triad_gamma.setRange(0.1, 5.0); self.triad_gamma.setSingleStep(0.05); self.triad_gamma.setValue(2.2)
+            self.triad_softness = QtWidgets.QDoubleSpinBox(); self.triad_softness.setRange(0.0, 4.0); self.triad_softness.setSingleStep(0.05); self.triad_softness.setValue(0.5)
+            self.triad_preserve_luma = QtWidgets.QCheckBox("Triad preserve luma")
+            self.triad_preserve_luma.setChecked(True)
             self.pixel_size = QtWidgets.QSpinBox()
             self.pixel_size.setRange(1, 16)
             self.pixel_size.setValue(2)
@@ -1331,6 +1373,9 @@ def launch_gui() -> None:
             effects_form.addRow("scanline value", self.scanline_val)
             effects_form.addRow("triad", self.triad_slider)
             effects_form.addRow("triad value", self.triad_val)
+            effects_form.addRow("triad gamma", self.triad_gamma)
+            effects_form.addRow("triad softness px", self.triad_softness)
+            effects_form.addRow(self.triad_preserve_luma)
             effects_form.addRow("pixel size", self.pixel_size)
             effects_form.addRow("aberration px", self.aberration)
             effects_form.addRow("noise", self.noise_val)
@@ -1598,7 +1643,9 @@ def launch_gui() -> None:
             out, self.prev_img = apply_crt_effect(
                 frame=frame,
                 scanline_strength=float(self.scanline_val.value()),
-                triad_mask=make_triad_mask(frame.shape[0], frame.shape[1], float(self.triad_val.value())) if self.triad_val.value() > 0.0 else None,
+                triad_mask=make_triad_mask(frame.shape[0], frame.shape[1], float(self.triad_val.value()), float(self.triad_softness.value())) if self.triad_val.value() > 0.0 else None,
+                triad_gamma=float(self.triad_gamma.value()),
+                triad_preserve_luma=bool(self.triad_preserve_luma.isChecked()),
                 aberration_px=int(self.aberration.value()),
                 bloom_sigma=float(self.bloom_sigma.value()),
                 bloom_strength=float(self.bloom_strength.value()),
@@ -1686,6 +1733,9 @@ def launch_gui() -> None:
                         height=opts["height"],
                         scanline_strength=float(self.scanline_val.value()),
                         triad_strength=float(self.triad_val.value()),
+                        triad_gamma=float(self.triad_gamma.value()),
+                        triad_preserve_luma=bool(self.triad_preserve_luma.isChecked()),
+                        triad_softness=float(self.triad_softness.value()),
                         aberration_px=int(self.aberration.value()),
                         bloom_sigma=float(self.bloom_sigma.value()),
                         bloom_strength=float(self.bloom_strength.value()),
@@ -1755,7 +1805,9 @@ def launch_gui() -> None:
             out, _ = apply_crt_effect(
                 frame=frame,
                 scanline_strength=float(self.scanline_val.value()),
-                triad_mask=make_triad_mask(frame.shape[0], frame.shape[1], float(self.triad_val.value())) if self.triad_val.value() > 0.0 else None,
+                triad_mask=make_triad_mask(frame.shape[0], frame.shape[1], float(self.triad_val.value()), float(self.triad_softness.value())) if self.triad_val.value() > 0.0 else None,
+                triad_gamma=float(self.triad_gamma.value()),
+                triad_preserve_luma=bool(self.triad_preserve_luma.isChecked()),
                 aberration_px=int(self.aberration.value()),
                 bloom_sigma=float(self.bloom_sigma.value()),
                 bloom_strength=float(self.bloom_strength.value()),
@@ -1825,6 +1877,9 @@ def launch_gui() -> None:
             return {
                 "scanline": float(self.scanline_val.value()),
                 "triad": float(self.triad_val.value()),
+                "triad_gamma": float(self.triad_gamma.value()),
+                "triad_softness": float(self.triad_softness.value()),
+                "triad_preserve_luma": bool(self.triad_preserve_luma.isChecked()),
                 "pixel_size": int(self.pixel_size.value()),
                 "aberration_px": int(self.aberration.value()),
                 "noise": float(self.noise_val.value()),
@@ -1872,6 +1927,12 @@ def launch_gui() -> None:
                 self.scanline_val.setValue(float(s["scanline"]))
             if "triad" in s:
                 self.triad_val.setValue(float(s["triad"]))
+            if "triad_gamma" in s:
+                self.triad_gamma.setValue(float(s["triad_gamma"]))
+            if "triad_softness" in s:
+                self.triad_softness.setValue(float(s["triad_softness"]))
+            if "triad_preserve_luma" in s:
+                self.triad_preserve_luma.setChecked(bool(s["triad_preserve_luma"]))
             if "pixel_size" in s:
                 self.pixel_size.setValue(int(s["pixel_size"]))
             if "aberration_px" in s:
