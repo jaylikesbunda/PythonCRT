@@ -560,6 +560,27 @@ def apply_crt_effect(
     scanline_angle: float = 0.0,
     scanline_thickness: float = 1.0,
     warp_strength: float = 0.0,
+    # EFX new
+    beam_spread_strength: float = 0.0,
+    hbleed_sigma: float = 0.0,
+    hbleed_strength: float = 0.0,
+    vbleed_sigma: float = 0.0,
+    vbleed_strength: float = 0.0,
+    jitter_amp_px: int = 0,
+    jitter_speed_hz: float = 0.0,
+    screen_jitter_amp_px: int = 0,
+    screen_jitter_speed_hz: float = 0.0,
+    rfi_strength: float = 0.0,
+    rfi_freq: float = 0.0,
+    rfi_speed_hz: float = 0.0,
+    rfi_angle_deg: float = 45.0,
+    waves_amp_px: int = 0,
+    waves_freq: float = 0.0,
+    waves_speed_hz: float = 0.0,
+    strobe_hz: float = 0.0,
+    strobe_duty: float = 0.5,
+    anaglyph_offset_px: int = 0,
+    anaglyph_mode: str = "red_cyan",
     text_overlay_rgba: Optional[np.ndarray] = None,
     text_overlay_after: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -614,15 +635,47 @@ def apply_crt_effect(
         t0 = time.perf_counter()
         img = _apply_triad_mask(img, triad_mask, triad_gamma, triad_preserve_luma)
         perf_add("crt.triad", time.perf_counter() - t0)
+    # Directional bleed (before scanlines for softer look)
+    if hbleed_strength > 0.0 and hbleed_sigma > 0.0:
+        t0 = time.perf_counter()
+        k = max(1, int(round(float(hbleed_sigma) * 3)) * 2 + 1)
+        hb = cv2.GaussianBlur(img, (k, 1), sigmaX=float(hbleed_sigma), sigmaY=0, borderType=cv2.BORDER_REPLICATE)
+        img = np.clip((1.0 - float(hbleed_strength)) * img + float(hbleed_strength) * hb, 0.0, 1.0)
+        perf_add("crt.hbleed", time.perf_counter() - t0)
+    if vbleed_strength > 0.0 and vbleed_sigma > 0.0:
+        t0 = time.perf_counter()
+        k = max(1, int(round(float(vbleed_sigma) * 3)) * 2 + 1)
+        vb = cv2.GaussianBlur(img, (1, k), sigmaX=0, sigmaY=float(vbleed_sigma), borderType=cv2.BORDER_REPLICATE)
+        img = np.clip((1.0 - float(vbleed_strength)) * img + float(vbleed_strength) * vb, 0.0, 1.0)
+        perf_add("crt.vbleed", time.perf_counter() - t0)
     if scanline_strength > 0.0:
         t0 = time.perf_counter()
-        if scanline_angle == 0.0 and scanline_thickness == 1.0:
-            sl = make_scanline_mask_dynamic(h, scanline_strength, scanline_period_px, scanline_phase_px)
-            img = np.clip(img * sl[:, None, None], 0.0, 1.0)
-        else:
-            sl2d = make_scanline_mask_2d(h, w, scanline_strength, scanline_period_px, scanline_phase_px, scanline_angle, scanline_thickness)
-            img = np.clip(img * sl2d[:, :, None], 0.0, 1.0)
+        if not hasattr(apply_crt_effect, "_scan_cache"):
+            apply_crt_effect._scan_cache = {}
+        # Quantize phase to reduce cache churn
+        phase_q = float(round(scanline_phase_px * 4.0) / 4.0)
+        key = (h, w, float(scanline_strength), float(scanline_period_px), float(scanline_angle), float(scanline_thickness), phase_q)
+        cache = apply_crt_effect._scan_cache
+        mask3 = cache.get(key)
+        if mask3 is None:
+            if scanline_angle == 0.0 and scanline_thickness == 1.0:
+                sl = make_scanline_mask_dynamic(h, scanline_strength, scanline_period_px, phase_q)
+                mask3 = sl[:, None, None].astype(np.float32)
+            else:
+                sl2d = make_scanline_mask_2d(h, w, scanline_strength, scanline_period_px, phase_q, scanline_angle, scanline_thickness)
+                mask3 = sl2d[:, :, None].astype(np.float32)
+            if len(cache) > 256:
+                cache.clear()
+            cache[key] = mask3
+        img = np.clip(img * mask3, 0.0, 1.0)
         perf_add("crt.scanlines", time.perf_counter() - t0)
+    # Beam width modulation (bright areas spread vertically)
+    if beam_spread_strength > 0.0:
+        t0 = time.perf_counter()
+        k = max(1, int(round(float(beam_spread_strength) * 6)) * 2 + 1)
+        vb = cv2.GaussianBlur(img, (1, k), sigmaX=0, sigmaY=max(0.5, float(beam_spread_strength) * 2.0), borderType=cv2.BORDER_REPLICATE)
+        img = np.clip(np.maximum(img, vb), 0.0, 1.0)
+        perf_add("crt.beam_spread", time.perf_counter() - t0)
     if vignette_mask is not None:
         t0 = time.perf_counter()
         img = np.clip(img * vignette_mask[:, :, None], 0.0, 1.0)
@@ -650,6 +703,78 @@ def apply_crt_effect(
         t0 = time.perf_counter()
         img = apply_barrel_warp(img, warp_strength)
         perf_add("crt.warp", time.perf_counter() - t0)
+    # Screen (global) vertical jitter
+    if screen_jitter_amp_px and abs(int(screen_jitter_amp_px)) > 0:
+        t0 = time.perf_counter()
+        amp = int(abs(int(screen_jitter_amp_px)))
+        jumps_per_sec = float(max(0.1, screen_jitter_speed_hz))
+        seg = int(np.floor(float(time_sec) * jumps_per_sec))
+        seed = (seg * 1664525 + (w << 4) + (h << 1) + 1013904223) & 0xFFFFFFFF
+        rng = np.random.default_rng(seed)
+        dy = int(rng.integers(-amp, amp + 1))
+        img = np.roll(img, dy, axis=0)
+        perf_add("crt.screen_jitter", time.perf_counter() - t0)
+    # Line jitter (small per-row offsets animated over time)
+    if jitter_amp_px and abs(int(jitter_amp_px)) > 0:
+        t0 = time.perf_counter()
+        amp = float(jitter_amp_px)
+        speed = float(max(0.0, jitter_speed_hz))
+        y = np.arange(h, dtype=np.float32)
+        offs_row = amp * np.sin(2.0 * np.pi * (y / max(1.0, float(h)) + speed * float(time_sec)))
+        x = np.arange(w, dtype=np.int32)[None, :]
+        xi = (x + np.rint(offs_row)[:, None].astype(np.int32)) % w
+        idx = np.broadcast_to(xi[:, :, None], img.shape)
+        img = np.take_along_axis(img, idx, axis=1)
+        perf_add("crt.jitter", time.perf_counter() - t0)
+    # RF interference (diagonal sinusoidal modulation)
+    if rfi_strength > 0.0 and rfi_freq > 0.0:
+        t0 = time.perf_counter()
+        yy, xx = np.mgrid[0:h, 0:w]
+        theta = np.deg2rad(float(rfi_angle_deg))
+        axis = (xx * np.cos(theta) + yy * np.sin(theta)) / max(1.0, float(w))
+        phase = 2.0 * np.pi * (float(rfi_freq) * axis + float(rfi_speed_hz) * float(time_sec))
+        mod = 1.0 + float(rfi_strength) * 0.08 * np.sin(phase)
+        img = np.clip(img * mod[:, :, None], 0.0, 1.0)
+        perf_add("crt.rf", time.perf_counter() - t0)
+    # Waves
+    if waves_amp_px and abs(float(waves_amp_px)) > 0.0 and waves_freq > 0.0:
+        t0 = time.perf_counter()
+        A = float(waves_amp_px)
+        f = float(waves_freq)
+        w2 = img.shape[1]
+        y = np.arange(h, dtype=np.float32)
+        phase_t = 2.0 * np.pi * float(max(0.0, waves_speed_hz)) * float(time_sec)
+        offs_row = A * np.sin(2.0 * np.pi * f * (y / max(1.0, float(h))) + phase_t)
+        x = np.arange(w2, dtype=np.int32)[None, :]
+        xi = (x + np.rint(offs_row)[:, None].astype(np.int32)) % w2
+        idx = np.broadcast_to(xi[:, :, None], img.shape)
+        img = np.take_along_axis(img, idx, axis=1)
+        perf_add("crt.waves", time.perf_counter() - t0)
+    # Strobe
+    if strobe_hz and float(strobe_hz) > 0.0:
+        t0 = time.perf_counter()
+        duty = float(np.clip(strobe_duty, 0.0, 1.0))
+        phase = (float(time_sec) * float(strobe_hz)) % 1.0
+        on = 1.0 if phase < duty else 0.0
+        img = np.clip(img * on, 0.0, 1.0)
+        perf_add("crt.strobe", time.perf_counter() - t0)
+    # Anaglyph 3D
+    if anaglyph_offset_px and abs(int(anaglyph_offset_px)) > 0:
+        t0 = time.perf_counter()
+        gray = (0.299 * img[:, :, 0] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 2]).astype(np.float32)
+        left = shift_channel(gray, int(anaglyph_offset_px), 0)
+        right = shift_channel(gray, -int(anaglyph_offset_px), 0)
+        mode = (anaglyph_mode or "red_cyan").lower()
+        if mode == "red_cyan":
+            r = left
+            g = right
+            b = right
+        else:
+            r = left
+            g = right
+            b = right
+        img = np.stack([r, g, b], axis=2)
+        perf_add("crt.anaglyph", time.perf_counter() - t0)
     if text_overlay_rgba is not None and text_overlay_after:
         t0 = time.perf_counter()
         ov = text_overlay_rgba
@@ -690,6 +815,11 @@ def apply_crt_effect(
             prev_arr = cv2.resize(state_prev, (w, h), interpolation=cv2.INTER_LINEAR)
         else:
             prev_arr = state_prev
+        # Ensure matching types for addWeighted
+        if prev_arr.dtype != np.float32:
+            prev_arr = prev_arr.astype(np.float32, copy=False)
+        if img.dtype != np.float32:
+            img = img.astype(np.float32, copy=False)
         img = cv2.addWeighted(prev_arr, float(persistence), img, float(1.0 - persistence), 0.0)
         perf_add("crt.persistence", time.perf_counter() - t0)
     t0 = time.perf_counter()
@@ -729,10 +859,33 @@ def apply_static_effects(
     scanline_angle: float = 0.0,
     scanline_thickness: float = 1.0,
     warp_strength: float = 0.0,
+    beam_spread_strength: float = 0.0,
+    hbleed_sigma: float = 0.0,
+    hbleed_strength: float = 0.0,
+    vbleed_sigma: float = 0.0,
+    vbleed_strength: float = 0.0,
+    jitter_amp_px: int = 0,
+    jitter_speed_hz: float = 0.0,
+    screen_jitter_amp_px: int = 0,
+    screen_jitter_speed_hz: float = 0.0,
+    rfi_strength: float = 0.0,
+    rfi_freq: float = 0.0,
+    rfi_speed_hz: float = 0.0,
+    rfi_angle_deg: float = 45.0,
+    waves_amp_px: int = 0,
+    waves_freq: float = 0.0,
+    waves_speed_hz: float = 0.0,
+    strobe_hz: float = 0.0,
+    strobe_duty: float = 0.5,
+    anaglyph_offset_px: int = 0,
+    anaglyph_mode: str = "red_cyan",
     text_overlay_rgba: Optional[np.ndarray] = None,
     text_overlay_after: bool = True,
 ) -> np.ndarray:
     t_all = time.perf_counter()
+    # Skip-unchanged caches (module-level or attached via function attributes)
+    if not hasattr(apply_static_effects, "_waves_cache"):
+        apply_static_effects._waves_cache = {}
     h, w = frame.shape[0], frame.shape[1]
     t0 = time.perf_counter()
     img = frame.astype(np.float32) / 255.0
@@ -784,6 +937,18 @@ def apply_static_effects(
         t0 = time.perf_counter()
         img = _apply_triad_mask(img, triad_mask, triad_gamma, triad_preserve_luma)
         perf_add("fx.triad", time.perf_counter() - t0)
+    if hbleed_strength > 0.0 and hbleed_sigma > 0.0:
+        t0 = time.perf_counter()
+        k = max(1, int(round(float(hbleed_sigma) * 3)) * 2 + 1)
+        hb = cv2.GaussianBlur(img, (k, 1), sigmaX=float(hbleed_sigma), sigmaY=0, borderType=cv2.BORDER_REPLICATE)
+        img = np.clip((1.0 - float(hbleed_strength)) * img + float(hbleed_strength) * hb, 0.0, 1.0)
+        perf_add("fx.hbleed", time.perf_counter() - t0)
+    if vbleed_strength > 0.0 and vbleed_sigma > 0.0:
+        t0 = time.perf_counter()
+        k = max(1, int(round(float(vbleed_sigma) * 3)) * 2 + 1)
+        vb = cv2.GaussianBlur(img, (1, k), sigmaX=0, sigmaY=float(vbleed_sigma), borderType=cv2.BORDER_REPLICATE)
+        img = np.clip((1.0 - float(vbleed_strength)) * img + float(vbleed_strength) * vb, 0.0, 1.0)
+        perf_add("fx.vbleed", time.perf_counter() - t0)
     if scanline_strength > 0.0:
         t0 = time.perf_counter()
         if scanline_angle == 0.0 and scanline_thickness == 1.0:
@@ -793,6 +958,12 @@ def apply_static_effects(
             sl2d = make_scanline_mask_2d(h, w, scanline_strength, scanline_period_px, scanline_phase_px, scanline_angle, scanline_thickness)
             img = np.clip(img * sl2d[:, :, None], 0.0, 1.0)
         perf_add("fx.scanlines", time.perf_counter() - t0)
+    if beam_spread_strength > 0.0:
+        t0 = time.perf_counter()
+        k = max(1, int(round(float(beam_spread_strength) * 6)) * 2 + 1)
+        vb = cv2.GaussianBlur(img, (1, k), sigmaX=0, sigmaY=max(0.5, float(beam_spread_strength) * 2.0), borderType=cv2.BORDER_REPLICATE)
+        img = np.clip(np.maximum(img, vb), 0.0, 1.0)
+        perf_add("fx.beam_spread", time.perf_counter() - t0)
     if vignette_mask is not None:
         t0 = time.perf_counter()
         img = np.clip(img * vignette_mask[:, :, None], 0.0, 1.0)
@@ -820,6 +991,85 @@ def apply_static_effects(
         t0 = time.perf_counter()
         img = apply_barrel_warp(img, warp_strength)
         perf_add("fx.warp", time.perf_counter() - t0)
+    if screen_jitter_amp_px and abs(int(screen_jitter_amp_px)) > 0:
+        t0 = time.perf_counter()
+        amp = int(abs(int(screen_jitter_amp_px)))
+        jumps_per_sec = float(max(0.1, screen_jitter_speed_hz))
+        seg = int(np.floor(float(time_sec) * jumps_per_sec))
+        seed = (seg * 1664525 + (w << 4) + (h << 1) + 1013904223) & 0xFFFFFFFF
+        rng = np.random.default_rng(seed)
+        dy = int(rng.integers(-amp, amp + 1))
+        img = np.roll(img, dy, axis=0)
+        perf_add("fx.screen_jitter", time.perf_counter() - t0)
+    if jitter_amp_px and abs(int(jitter_amp_px)) > 0:
+        t0 = time.perf_counter()
+        amp = float(jitter_amp_px)
+        speed = float(max(0.0, jitter_speed_hz))
+        y = np.arange(h, dtype=np.float32)
+        offs_row = amp * np.sin(2.0 * np.pi * (y / max(1.0, float(h)) + speed * float(time_sec)))
+        x = np.arange(w, dtype=np.int32)[None, :]
+        xi = (x + np.rint(offs_row)[:, None].astype(np.int32)) % w
+        idx = np.broadcast_to(xi[:, :, None], img.shape)
+        img = np.take_along_axis(img, idx, axis=1)
+        perf_add("fx.jitter", time.perf_counter() - t0)
+    if rfi_strength > 0.0 and rfi_freq > 0.0:
+        t0 = time.perf_counter()
+        yy, xx = np.mgrid[0:h, 0:w]
+        theta = np.deg2rad(float(rfi_angle_deg))
+        axis = (xx * np.cos(theta) + yy * np.sin(theta)) / max(1.0, float(w))
+        phase = 2.0 * np.pi * (float(rfi_freq) * axis + float(rfi_speed_hz) * float(time_sec))
+        mod = 1.0 + float(rfi_strength) * 0.08 * np.sin(phase)
+        img = np.clip(img * mod[:, :, None], 0.0, 1.0)
+        perf_add("fx.rf", time.perf_counter() - t0)
+    # Waves
+    if waves_amp_px and abs(float(waves_amp_px)) > 0.0 and waves_freq > 0.0:
+        t0 = time.perf_counter()
+        A = float(waves_amp_px)
+        f = float(waves_freq)
+        w2 = img.shape[1]
+        y = np.arange(h, dtype=np.float32)
+        phase_t = 2.0 * np.pi * float(max(0.0, waves_speed_hz)) * float(time_sec)
+        key = (h, w2, round(A, 3), round(f, 4), int(np.rint(phase_t)))
+        cache = apply_static_effects._waves_cache
+        xi = None
+        if key in cache:
+            xi = cache[key]
+        else:
+            offs_row = A * np.sin(2.0 * np.pi * f * (y / max(1.0, float(h))) + phase_t)
+            x = np.arange(w2, dtype=np.int32)[None, :]
+            xi = (x + np.rint(offs_row)[:, None].astype(np.int32)) % w2
+            # cap cache size
+            if len(cache) > 64:
+                cache.clear()
+            cache[key] = xi
+        idx = np.broadcast_to(xi[:, :, None], img.shape)
+        img = np.take_along_axis(img, idx, axis=1)
+        perf_add("fx.waves", time.perf_counter() - t0)
+    # Strobe
+    if strobe_hz and float(strobe_hz) > 0.0:
+        t0 = time.perf_counter()
+        duty = float(np.clip(strobe_duty, 0.0, 1.0))
+        phase = (float(time_sec) * float(strobe_hz)) % 1.0
+        on = 1.0 if phase < duty else 0.0
+        img = np.clip(img * on, 0.0, 1.0)
+        perf_add("fx.strobe", time.perf_counter() - t0)
+    # Anaglyph 3D
+    if anaglyph_offset_px and abs(int(anaglyph_offset_px)) > 0:
+        t0 = time.perf_counter()
+        gray = (0.299 * img[:, :, 0] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 2]).astype(np.float32)
+        left = shift_channel(gray, int(anaglyph_offset_px), 0)
+        right = shift_channel(gray, -int(anaglyph_offset_px), 0)
+        mode = (anaglyph_mode or "red_cyan").lower()
+        if mode == "red_cyan":
+            r = left
+            g = right
+            b = right
+        else:
+            r = left
+            g = right
+            b = right
+        img = np.stack([r, g, b], axis=2)
+        perf_add("fx.anaglyph", time.perf_counter() - t0)
     # Text overlay after effects
     if text_overlay_rgba is not None and text_overlay_after:
         t0 = time.perf_counter()
@@ -902,6 +1152,11 @@ def process_video(
     scanline_angle: float = 0.0,
     scanline_thickness: float = 1.0,
     warp_strength: float = 0.0,
+    beam_spread_strength: float = 0.0,
+    hbleed_sigma: float = 0.0,
+    hbleed_strength: float = 0.0,
+    vbleed_sigma: float = 0.0,
+    vbleed_strength: float = 0.0,
     text: str = "",
     text_font: str = "",
     text_size: int = 36,
@@ -909,6 +1164,7 @@ def process_video(
     text_pos: Tuple[int, int] = (32, 32),
     text_after: bool = True,
     progress_cb: Optional[Callable[[float], None]] = None,
+    offload_filters: bool = False,
 ) -> bool:
     clip = VideoFileClip(str(input_path))
     fps_out = int(fps) if fps and fps > 0 else int(clip.fps or 24)
@@ -1000,6 +1256,21 @@ def process_video(
                 ]
             else:
                 ffparams = ["-crf", str(crf), "-pix_fmt", "yuv420p"]
+        # Optionally offload H/V bleed to FFmpeg filtergraph
+        vf_filters: Optional[str] = None
+        if offload_filters and ((hbleed_strength > 0.0 and hbleed_sigma > 0.0) or (vbleed_strength > 0.0 and vbleed_sigma > 0.0)):
+            parts = ["split[orig][tmp]"]
+            last = "orig"
+            if hbleed_strength > 0.0 and hbleed_sigma > 0.0:
+                parts.append(f"[{last}]gblur=sigmaX={max(0.1, hbleed_sigma)}:sigmaY=0[hb]")
+                parts.append(f"[tmp][hb]blend=all_mode=normal:all_opacity={min(1.0, max(0.0, hbleed_strength))}[mixh]")
+                last = "mixh"
+            if vbleed_strength > 0.0 and vbleed_sigma > 0.0:
+                parts.append(f"[{last}]gblur=sigmaX=0:sigmaY={max(0.1, vbleed_sigma)}[vb]")
+                parts.append(f"[tmp][vb]blend=all_mode=normal:all_opacity={min(1.0, max(0.0, vbleed_strength))}[mixv]")
+                last = "mixv"
+            parts.append(f"[{last}]copy[out]")
+            vf_filters = ",".join(parts)
         writer_kwargs = dict(
             filename=str(output_path),
             size=(out_w, out_h),
@@ -1009,11 +1280,14 @@ def process_video(
             threads=os.cpu_count() or 4,
             ffmpeg_params=ffparams,
         )
+        if vf_filters is not None:
+            writer_kwargs["ffmpeg_params"] = ffparams + ["-filter_complex", vf_filters, "-map", "[out]"]
         if not used_gpu:
             writer_kwargs["preset"] = "medium"
         writer = FFMPEG_VideoWriter(**writer_kwargs)
-        max_workers = max(1, min(2, (os.cpu_count() or 4) // 2))
-        queue_cap = max_workers * 4
+        # Use CPU-1 worker threads; numpy/OpenCV release the GIL during heavy ops
+        max_workers = max(1, (os.cpu_count() or 4) - 1)
+        queue_cap = max_workers * 6
         executor = ThreadPoolExecutor(max_workers=max_workers)
         futures = {}
         next_write = 0
@@ -1034,6 +1308,8 @@ def process_video(
             frame_iter = perf_timed_iter(hw_reader.iter_frames(), "io.hw_decode")
         else:
             frame_iter = perf_timed_iter(clip.iter_frames(fps=fps_out, dtype="uint8"), "io.decode")
+        # Precompute static text overlay once for the whole render
+        overlay_rgba = _make_text_overlay_rgba_qt(out_w, out_h, text, text_font, text_size, text_color, text_pos) if text else None
         for frame in frame_iter:
             t_submit = time.perf_counter()
             if frame.shape[1] != out_w or frame.shape[0] != out_h:
@@ -1073,7 +1349,12 @@ def process_video(
                     scanline_angle=float(scanline_angle),
                     scanline_thickness=float(scanline_thickness),
                     warp_strength=float(warp_strength),
-                    text_overlay_rgba=_make_text_overlay_rgba_qt(out_w, out_h, text, text_font, text_size, text_color, text_pos) if text else None,
+                    beam_spread_strength=float(beam_spread_strength),
+                    hbleed_sigma=0.0 if vf_filters is not None else float(hbleed_sigma),
+                    hbleed_strength=0.0 if vf_filters is not None else float(hbleed_strength),
+                    vbleed_sigma=0.0 if vf_filters is not None else float(vbleed_sigma),
+                    vbleed_strength=0.0 if vf_filters is not None else float(vbleed_strength),
+                    text_overlay_rgba=overlay_rgba,
                     text_overlay_after=bool(text_after),
                 )
             futures[i] = submit_job(i, frame, phase)
@@ -1189,6 +1470,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--scanline-angle", type=float, default=0.0)
     p.add_argument("--scanline-thickness", type=float, default=1.0)
     p.add_argument("--warp-strength", type=float, default=0.0)
+    p.add_argument("--beam-spread", type=float, default=0.0)
+    p.add_argument("--hbleed-sigma", type=float, default=0.0)
+    p.add_argument("--hbleed-strength", type=float, default=0.0)
+    p.add_argument("--vbleed-sigma", type=float, default=0.0)
+    p.add_argument("--vbleed-strength", type=float, default=0.0)
     # Text overlay
     p.add_argument("--text", type=str, default="")
     p.add_argument("--text-font", type=str, default="")
@@ -1203,6 +1489,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--decoder", type=str, default="auto", choices=["auto", "nvidia", "amd", "intel", "cpu"])
     p.add_argument("--glitch-amp", type=int, default=0)
     p.add_argument("--glitch-height", type=float, default=0.0)
+    p.add_argument("--offload-filters", action="store_true")
     p.add_argument("--gui", action="store_true")
     return p.parse_args()
 
@@ -1258,12 +1545,18 @@ def main() -> None:
         scanline_angle=float(a.scanline_angle),
         scanline_thickness=float(max(0.1, a.scanline_thickness)),
         warp_strength=float(max(-1.0, min(1.0, a.warp_strength))),
+        beam_spread_strength=float(max(0.0, a.beam_spread)),
+        hbleed_sigma=float(max(0.0, a.hbleed_sigma)),
+        hbleed_strength=float(max(0.0, min(1.0, a.hbleed_strength))),
+        vbleed_sigma=float(max(0.0, a.vbleed_sigma)),
+        vbleed_strength=float(max(0.0, min(1.0, a.vbleed_strength))),
         text=str(a.text),
         text_font=str(a.text_font),
         text_size=int(a.text_size),
         text_color=str(a.text_color),
         text_pos=(int(a.text_x), int(a.text_y)),
         text_after=bool(a.text_after),
+        offload_filters=bool(a.offload_filters),
     )
     print("Hardware encoder used" if used_gpu else "CPU x264 used")
     print(f"elapsed {time.perf_counter() - t_main:.3f}s")
@@ -1332,10 +1625,9 @@ def launch_gui() -> None:
                         return None
                 if frame is None:
                     return None
-                # Convert BGR->RGB and scale
+                # Convert BGR->RGB
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                if (frame.shape[1] != self.width) or (frame.shape[0] != self.height):
-                    frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
+                # Do not scale here; preview scales dynamically per current widget size
                 return frame.astype(np.uint8)
             except Exception:
                 return None
@@ -1430,6 +1722,26 @@ def launch_gui() -> None:
             self.scanline_angle = QtWidgets.QDoubleSpinBox(); self.scanline_angle.setRange(-45.0, 45.0); self.scanline_angle.setSingleStep(0.5); self.scanline_angle.setValue(0.0)
             self.scanline_thickness = QtWidgets.QDoubleSpinBox(); self.scanline_thickness.setRange(0.1, 4.0); self.scanline_thickness.setSingleStep(0.1); self.scanline_thickness.setValue(1.0)
             self.warp_strength = QtWidgets.QDoubleSpinBox(); self.warp_strength.setRange(-1.0, 1.0); self.warp_strength.setSingleStep(0.05); self.warp_strength.setValue(0.0)
+            # EFX controls
+            self.waves_amp = QtWidgets.QSpinBox(); self.waves_amp.setRange(-256, 256); self.waves_amp.setValue(0)
+            self.waves_freq = QtWidgets.QDoubleSpinBox(); self.waves_freq.setRange(0.0, 10.0); self.waves_freq.setSingleStep(0.05); self.waves_freq.setValue(0.0)
+            self.waves_speed = QtWidgets.QDoubleSpinBox(); self.waves_speed.setRange(0.0, 240.0); self.waves_speed.setSingleStep(0.5); self.waves_speed.setValue(0.0)
+            self.strobe_hz = QtWidgets.QDoubleSpinBox(); self.strobe_hz.setRange(0.0, 240.0); self.strobe_hz.setSingleStep(0.5); self.strobe_hz.setValue(0.0)
+            self.strobe_duty = QtWidgets.QDoubleSpinBox(); self.strobe_duty.setRange(0.0, 1.0); self.strobe_duty.setSingleStep(0.05); self.strobe_duty.setValue(0.5)
+            self.anaglyph_offset = QtWidgets.QSpinBox(); self.anaglyph_offset.setRange(-64, 64); self.anaglyph_offset.setValue(0)
+            self.anaglyph_mode = QtWidgets.QComboBox(); self.anaglyph_mode.addItems(["red_cyan"]) ; self.anaglyph_mode.setCurrentIndex(0)
+            self.beam_spread = QtWidgets.QDoubleSpinBox(); self.beam_spread.setRange(0.0, 8.0); self.beam_spread.setSingleStep(0.1); self.beam_spread.setValue(0.0)
+            self.hbleed_sigma = QtWidgets.QDoubleSpinBox(); self.hbleed_sigma.setRange(0.0, 8.0); self.hbleed_sigma.setSingleStep(0.1); self.hbleed_sigma.setValue(0.0)
+            self.hbleed_strength = QtWidgets.QDoubleSpinBox(); self.hbleed_strength.setRange(0.0, 1.0); self.hbleed_strength.setSingleStep(0.05); self.hbleed_strength.setValue(0.0)
+            self.vbleed_sigma = QtWidgets.QDoubleSpinBox(); self.vbleed_sigma.setRange(0.0, 8.0); self.vbleed_sigma.setSingleStep(0.1); self.vbleed_sigma.setValue(0.0)
+            self.vbleed_strength = QtWidgets.QDoubleSpinBox(); self.vbleed_strength.setRange(0.0, 1.0); self.vbleed_strength.setSingleStep(0.05); self.vbleed_strength.setValue(0.0)
+            # removed line jitter controls
+            self.rfi_strength = QtWidgets.QDoubleSpinBox(); self.rfi_strength.setRange(0.0, 1.0); self.rfi_strength.setSingleStep(0.05); self.rfi_strength.setValue(0.0)
+            self.rfi_freq = QtWidgets.QDoubleSpinBox(); self.rfi_freq.setRange(0.0, 50.0); self.rfi_freq.setSingleStep(0.5); self.rfi_freq.setValue(0.0)
+            self.rfi_speed = QtWidgets.QDoubleSpinBox(); self.rfi_speed.setRange(0.0, 240.0); self.rfi_speed.setSingleStep(0.5); self.rfi_speed.setValue(0.0)
+            self.rfi_angle = QtWidgets.QDoubleSpinBox(); self.rfi_angle.setRange(-90.0, 90.0); self.rfi_angle.setSingleStep(1.0); self.rfi_angle.setValue(45.0)
+            self.screen_jitter_amp = QtWidgets.QSpinBox(); self.screen_jitter_amp.setRange(-64, 64); self.screen_jitter_amp.setValue(0)
+            self.screen_jitter_speed = QtWidgets.QDoubleSpinBox(); self.screen_jitter_speed.setRange(0.0, 240.0); self.screen_jitter_speed.setSingleStep(0.5); self.screen_jitter_speed.setValue(0.0)
             # Text overlay controls
             self.text_input = QtWidgets.QLineEdit()
             self.text_font_combo = QtWidgets.QFontComboBox()
@@ -1573,6 +1885,29 @@ def launch_gui() -> None:
             adv_form.addRow("scanline angle", self.scanline_angle)
             adv_form.addRow("scanline thickness", self.scanline_thickness)
             adv_form.addRow("warp strength", self.warp_strength)
+            # EFX tab
+            efx_form = QtWidgets.QFormLayout()
+            efx_form.setLabelAlignment(QtCore.Qt.AlignRight)
+            efx_form.addRow("waves amp (px)", self.waves_amp)
+            efx_form.addRow("waves freq", self.waves_freq)
+            efx_form.addRow("waves speed (hz)", self.waves_speed)
+            efx_form.addRow("strobe hz", self.strobe_hz)
+            efx_form.addRow("strobe duty (0-1)", self.strobe_duty)
+            efx_form.addRow("3D offset (px)", self.anaglyph_offset)
+            efx_form.addRow("3D mode", self.anaglyph_mode)
+            efx_form.addRow("beam spread", self.beam_spread)
+            efx_form.addRow("h bleed sigma", self.hbleed_sigma)
+            efx_form.addRow("h bleed strength", self.hbleed_strength)
+            efx_form.addRow("v bleed sigma", self.vbleed_sigma)
+            efx_form.addRow("v bleed strength", self.vbleed_strength)
+            # removed line jitter rows
+            efx_form.addRow("RF strength", self.rfi_strength)
+            efx_form.addRow("RF freq", self.rfi_freq)
+            efx_form.addRow("RF speed (hz)", self.rfi_speed)
+            efx_form.addRow("RF angle (deg)", self.rfi_angle)
+            efx_form.addRow("screen jitter amp (px)", self.screen_jitter_amp)
+            efx_form.addRow("screen jitter speed (hz)", self.screen_jitter_speed)
+            efx_tab = QtWidgets.QWidget(); efx_tab.setLayout(efx_form)
             # Text: move to its own tab
             text_form = QtWidgets.QFormLayout()
             text_form.setLabelAlignment(QtCore.Qt.AlignRight)
@@ -1607,6 +1942,7 @@ def launch_gui() -> None:
             tabs.addTab(effects_tab, "Effects")
             tabs.addTab(motion_tab, "Motion")
             tabs.addTab(adv_tab, "Advanced")
+            tabs.addTab(efx_tab, "EFX")
             tabs.addTab(text_tab, "Text")
             tabs.addTab(output_tab, "Output")
             splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
@@ -1641,12 +1977,28 @@ def launch_gui() -> None:
             self.actFast.setCheckable(True)
             self.actFast.setChecked(True)
             bar.addAction(self.actOpen)
-            bar.addAction(self.actPlay)
             bar.addAction(self.actRender)
             bar.addSeparator()
             bar.addAction(self.actGPU)
             bar.addAction(self.actHWDec)
             bar.addAction(self.actFast)
+            # Transport controls
+            self.actPrevFrame = QtGui.QAction(self.style().standardIcon(QtWidgets.QStyle.SP_MediaSkipBackward), "Prev", self)
+            self.actNextFrame = QtGui.QAction(self.style().standardIcon(QtWidgets.QStyle.SP_MediaSkipForward), "Next", self)
+            self.actBack5 = QtGui.QAction("-5s", self)
+            self.actFwd5 = QtGui.QAction("+5s", self)
+            bar.addSeparator()
+            bar.addAction(self.actBack5)
+            bar.addAction(self.actPrevFrame)
+            bar.addAction(self.actPlay)
+            bar.addAction(self.actNextFrame)
+            bar.addAction(self.actFwd5)
+            self.loop_cb = QtWidgets.QCheckBox("Loop")
+            self.loop_cb.setChecked(True)
+            self.speed_combo = QtWidgets.QComboBox(); self.speed_combo.addItems(["0.25x","0.5x","1x","1.5x","2x","4x"]); self.speed_combo.setCurrentText("1x")
+            bar.addWidget(QtWidgets.QLabel("Speed:"))
+            bar.addWidget(self.speed_combo)
+            bar.addWidget(self.loop_cb)
             self.status = self.statusBar()
             self.time_label = QtWidgets.QLabel("00:00 / 00:00")
             self.status.addPermanentWidget(self.time_label)
@@ -1664,6 +2016,10 @@ def launch_gui() -> None:
             self.actHWDec.toggled.connect(self.on_hwdec_toggle)
             self.actFast.toggled.connect(self.fast_bloom_cb.setChecked)
             self.fast_bloom_cb.toggled.connect(self.actFast.setChecked)
+            self.actPrevFrame.triggered.connect(self.on_prev_frame)
+            self.actNextFrame.triggered.connect(self.on_next_frame)
+            self.actBack5.triggered.connect(lambda: self.nudge_time(-5.0))
+            self.actFwd5.triggered.connect(lambda: self.nudge_time(5.0))
             self.scanline_slider.valueChanged.connect(self.on_scanline_slider)
             self.triad_slider.valueChanged.connect(self.on_triad_slider)
             self.scanline_val.valueChanged.connect(self.on_scanline_val)
@@ -1683,6 +2039,15 @@ def launch_gui() -> None:
 
             # Capture defaults for Reset
             self._defaults = self._collect_settings()
+            # Seek slider
+            self.seek_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+            self.seek_slider.setRange(0, 1000)
+            self.seek_slider.setTracking(False)
+            self.status.addPermanentWidget(self.seek_slider)
+            self._seeking = False
+            self.seek_slider.sliderPressed.connect(self.on_seek_press)
+            self.seek_slider.sliderReleased.connect(self.on_seek_release)
+            self.seek_slider.valueChanged.connect(self.on_seek_change)
 
             # Live refresh when text controls change
             self.text_input.textChanged.connect(lambda _=None: self._render_current_frame())
@@ -1768,6 +2133,13 @@ def launch_gui() -> None:
             self.timer.setInterval(int(1000 / fps))
             self.t = 0.0
             self._restart_hw_reader()
+            # Reset seek slider
+            try:
+                dur = float(self.clip.duration or 0.0)
+                self.seek_slider.setEnabled(dur > 0.0)
+                self.seek_slider.setValue(0)
+            except Exception:
+                pass
             self._render_current_frame()
 
         def on_play_pause(self) -> None:
@@ -1801,8 +2173,7 @@ def launch_gui() -> None:
             avail_h = max(1, self.video_label.height())
             scale = min(avail_w / max(1, w), avail_h / max(1, h))
             if scale != 1.0:
-                im = Image.fromarray(frame)
-                frame = np.asarray(im.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.BILINEAR))
+                frame = cv2.resize(frame, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_LINEAR)
             # Compute scaled text overlay size/position so UI values represent output pixels
             txt_scale = float(scale)
             txt_size_px = max(1, int(self.text_size.value() * txt_scale))
@@ -1839,6 +2210,26 @@ def launch_gui() -> None:
                 scanline_angle=float(self.scanline_angle.value()),
                 scanline_thickness=float(self.scanline_thickness.value()),
                 warp_strength=float(self.warp_strength.value()),
+                beam_spread_strength=float(self.beam_spread.value()),
+                hbleed_sigma=float(self.hbleed_sigma.value()),
+                hbleed_strength=float(self.hbleed_strength.value()),
+                vbleed_sigma=float(self.vbleed_sigma.value()),
+                vbleed_strength=float(self.vbleed_strength.value()),
+                jitter_amp_px=0,
+                jitter_speed_hz=0.0,
+                screen_jitter_amp_px=int(self.screen_jitter_amp.value()),
+                screen_jitter_speed_hz=float(self.screen_jitter_speed.value()),
+                rfi_strength=float(self.rfi_strength.value()),
+                rfi_freq=float(self.rfi_freq.value()),
+                rfi_speed_hz=float(self.rfi_speed.value()),
+                rfi_angle_deg=float(self.rfi_angle.value()),
+                waves_amp_px=int(self.waves_amp.value()),
+                waves_freq=float(self.waves_freq.value()),
+                waves_speed_hz=float(self.waves_speed.value()),
+                strobe_hz=float(self.strobe_hz.value()),
+                strobe_duty=float(self.strobe_duty.value()),
+                anaglyph_offset_px=int(self.anaglyph_offset.value()),
+                anaglyph_mode=str(self.anaglyph_mode.currentText()),
                 text_overlay_rgba=_make_text_overlay_rgba_qt(
                     frame.shape[1],
                     frame.shape[0],
@@ -1853,12 +2244,26 @@ def launch_gui() -> None:
             qimg = QtGui.QImage(out.data, out.shape[1], out.shape[0], out.strides[0], QtGui.QImage.Format_RGB888)
             pix = QtGui.QPixmap.fromImage(qimg)
             self.video_label.setPixmap(pix)
-            self.t += 1.0 / max(1.0, self.clip.fps or 24.0)
+            self.t += self._speed_factor() * (1.0 / max(1.0, self.clip.fps or 24.0))
             if self.t >= float(self.clip.duration or 1.0):
-                self.t = 0.0
+                if self.loop_cb.isChecked():
+                    self.t = 0.0
+                else:
+                    self.t = float(self.clip.duration or 0.0)
+                    self.playing = False
+                    self.timer.stop()
             tl = int(self.t)
             dur = int(self.clip.duration or 0)
             self.time_label.setText(f"{tl//60:02d}:{tl%60:02d} / {dur//60:02d}:{dur%60:02d}")
+            # update seek
+            try:
+                durf = float(self.clip.duration or 0.0)
+                if durf > 0 and not self._seeking:
+                    self.seek_slider.blockSignals(True)
+                    self.seek_slider.setValue(int((self.t / durf) * 1000))
+                    self.seek_slider.blockSignals(False)
+            except Exception:
+                pass
 
         def resizeEvent(self, e: QtGui.QResizeEvent) -> None:
             super().resizeEvent(e)
@@ -1875,9 +2280,7 @@ def launch_gui() -> None:
                         QtCore.Qt.SmoothTransformation,
                     )
                 )
-            # Adjust HW reader scale
-            if self.actHWDec.isChecked() and self.hw_reader is not None:
-                self._restart_hw_reader()
+            # No restart on resize; scaling is done dynamically in on_tick
 
         def on_render(self) -> None:
             if self.clip is None:
@@ -1934,6 +2337,12 @@ def launch_gui() -> None:
                         scanline_angle=float(self.scanline_angle.value()),
                         scanline_thickness=float(self.scanline_thickness.value()),
                         warp_strength=float(self.warp_strength.value()),
+                        beam_spread_strength=float(self.beam_spread.value()),
+                        hbleed_sigma=float(self.hbleed_sigma.value()),
+                        hbleed_strength=float(self.hbleed_strength.value()),
+                        vbleed_sigma=float(self.vbleed_sigma.value()),
+                        vbleed_strength=float(self.vbleed_strength.value()),
+                        offload_filters=bool(self.fast_bloom_cb.isChecked() and False),
                         text=str(self.text_input.text()),
                         text_font=str(self._effective_font_spec()),
                         text_size=int(self.text_size.value()),
@@ -2015,6 +2424,50 @@ def launch_gui() -> None:
             qimg = QtGui.QImage(out.data, out.shape[1], out.shape[0], out.strides[0], QtGui.QImage.Format_RGB888)
             pix = QtGui.QPixmap.fromImage(qimg)
             self.video_label.setPixmap(pix)
+
+        def _speed_factor(self) -> float:
+            s = self.speed_combo.currentText().lower().replace("x", "").strip()
+            try:
+                return float(s) if s else 1.0
+            except Exception:
+                return 1.0
+
+        def on_prev_frame(self) -> None:
+            if self.clip is None:
+                return
+            fps = max(1.0, float(self.clip.fps or 24.0))
+            self.t = max(0.0, self.t - 1.0 / fps)
+            self._render_current_frame()
+
+        def on_next_frame(self) -> None:
+            if self.clip is None:
+                return
+            fps = max(1.0, float(self.clip.fps or 24.0))
+            self.t = min(float(self.clip.duration or 0.0), self.t + 1.0 / fps)
+            self._render_current_frame()
+
+        def nudge_time(self, dt: float) -> None:
+            if self.clip is None:
+                return
+            dur = float(self.clip.duration or 0.0)
+            self.t = float(np.clip(self.t + float(dt), 0.0, dur))
+            self._render_current_frame()
+
+        def on_seek_press(self) -> None:
+            self._seeking = True
+
+        def on_seek_release(self) -> None:
+            self._seeking = False
+            self.on_seek_change(self.seek_slider.value())
+
+        def on_seek_change(self, v: int) -> None:
+            if self.clip is None:
+                return
+            dur = float(self.clip.duration or 0.0)
+            if dur <= 0:
+                return
+            self.t = (float(v) / 1000.0) * dur
+            self._render_current_frame()
 
         def on_reset(self) -> None:
             if hasattr(self, "_defaults") and isinstance(self._defaults, dict):
